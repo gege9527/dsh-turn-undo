@@ -24,7 +24,10 @@
     "client.js",
     "cordis.patch.yml"
   ],
-  "repository": "github:gege9527/dsh-turn-undo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gege9527/dsh-turn-undo.git"
+  },
   "bugs": "https://github.com/gege9527/dsh-turn-undo/issues",
   "homepage": "https://github.com/gege9527/dsh-turn-undo#readme",
   "license": "MIT",
