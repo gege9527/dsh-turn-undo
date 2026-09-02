@@ -1,0 +1,42 @@
+{
+  "name": "dsh-turn-undo",
+  "version": "0.0.1",
+  "description": "Undo to any point in a DSH conversation — revert files and fork a new session",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "repository": "github:gege9527/dsh-turn-undo",
+  "bugs": "https://github.com/gege9527/dsh-turn-undo/issues",
+  "homepage": "https://github.com/gege9527/dsh-turn-undo#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": false
+    }
+  }
+}

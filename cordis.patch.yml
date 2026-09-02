@@ -1,0 +1,9 @@
+# The dsh-turn-undo bundle patch
+# Inserted over whatever layers came before it.
+# A patch replaces the targeted row's whole config, so a profile overriding
+# this row must restate every key it means to keep.
+
+- insert:
+    - id: turn-undo
+      name: dsh-turn-undo
+      config: {}
