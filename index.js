@@ -887,6 +887,9 @@ function createHandler(ctx, runtime, sessions, agents) {
           }
         }
 
+        // Wait for any in-flight snapshot capture so the preview reflects the
+        // latest committed workspace state (avoids showing a stale turn/end).
+        try { await runtime.waitForSnapshots() } catch {}
         const preview = runtime.store.preview(sessionId, targetTurn)
         return json(response, 200, preview)
       }
@@ -921,6 +924,18 @@ function createHandler(ctx, runtime, sessions, agents) {
         //    Without this, a restore issued right after turn/end may read an
         //    empty snapshot chain and skip file restoration.
         try { await runtime.waitForSnapshots() } catch {}
+
+        // 3.5 Safety snapshot: before this irreversible restore wipes files,
+        //    force-capture the CURRENT workspace into the session chain (as a
+        //    fractional turn just past the newest snapshot) so the user can
+        //    restore again to the pre-undo state if needed. Non-fatal on failure.
+        try {
+          const chain = runtime.store.loadChain(sessionId)
+          const lastTurn = chain.length ? chain[chain.length - 1].turn : 0
+          await runtime.captureNow(cwd, sessionId, lastTurn + 0.5)
+        } catch (e) {
+          console.warn('[turn-undo] safety snapshot failed (non-fatal):', e?.message)
+        }
 
         // 4. Restore files to the best snapshot at/before restoreTurn.
         let restoreResult
@@ -1026,49 +1041,46 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
     return { ok: true, status: 'ready', targetTurn: null, totalChanges: 0, changes: [] }
   }
 
-  // The turn/end snapshot shows the workspace after AI work in this turn.
-  let target = null
+  // 撤销"发送这条消息之前"会一并回退该消息之后的所有改动，因此影响范围 =
+  // baseline（targetTurn 之前最近的快照，即恢复到什么状态）与 latest
+  // （会话最新快照，即撤销点之后累积到当前的状态终点）之差。
+  // baseline 取小于 targetTurn 的最新快照：正常是该 turn/start 快照
+  // (T - 0.5)，若中间某 turn 无文件变化没写 manifest，则回退到更早的最近
+  // 快照；对于没有前置快照的首条消息，用空对象 {} 作为基线（即回到空状态）。
+  let baseline = null
   for (const m of chain) {
-    if (m.turn === targetTurn) {
-      target = m
-      break
+    if (m.turn < targetTurn && (baseline === null || m.turn > baseline.turn)) {
+      baseline = m
     }
   }
-  if (!target) {
+  const baselineManifest = baseline ? baseline.manifest : {}
+
+  if (chain.length === 0) {
     return { ok: true, status: 'ready', targetTurn, totalChanges: 0, changes: [], noSnapshot: true }
   }
 
-  // Use the newest snapshot strictly before this turn as the baseline.
-  // It is normally the turn/start snapshot (T - 0.5), but if an intermediate
-  // turn had no file changes, no manifest was written, so we fall back to the
-  // most recent available baseline. For the very first turn we use an empty
-  // baseline.
-  let prev = null
-  for (const m of chain) {
-    if (m.turn < targetTurn && (prev === null || m.turn > prev.turn)) {
-      prev = m
-    }
-  }
-  const prevManifest = prev ? prev.manifest : {}
+  // 会话最新快照 = 撤销点之后所有改动的累积终点。
+  const latest = chain[chain.length - 1]
+  const latestManifest = latest.manifest
 
-  // Calculate changes: files that differ between turn/start and turn/end.
+  // Calculate changes between latest and baseline: these are the files that
+  // undo (restoring to baseline) will affect — every change made at or after
+  // the target turn.
   const changes = []
-  const targetManifest = target.manifest
-
-  for (const rel of Object.keys(targetManifest)) {
-    const entry = targetManifest[rel]
-    if (!prevManifest[rel]) {
+  for (const rel of Object.keys(latestManifest)) {
+    const entry = latestManifest[rel]
+    if (!baselineManifest[rel]) {
       changes.push({ path: rel, kind: 'created' })
     } else {
-      const prevEntry = prevManifest[rel]
+      const prevEntry = baselineManifest[rel]
       if (entry.hash !== prevEntry.hash) {
         changes.push({ path: rel, kind: 'modified' })
       }
     }
   }
 
-  for (const rel of Object.keys(prevManifest)) {
-    if (!targetManifest[rel]) {
+  for (const rel of Object.keys(baselineManifest)) {
+    if (!latestManifest[rel]) {
       changes.push({ path: rel, kind: 'deleted' })
     }
   }
@@ -1076,7 +1088,7 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
   return {
     ok: true,
     status: 'ready',
-    targetTurn: target.turn,
+    targetTurn,
     totalChanges: changes.length,
     changes,
   }

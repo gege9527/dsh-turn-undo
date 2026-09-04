@@ -5,7 +5,7 @@
 ## 功能
 
 - ✅ 每条用户消息的操作栏注入一个“撤销”按钮（↺）。
-- ✅ 弹窗显示本轮会恢复/删除/修改的文件，并给出警告。
+- ✅ 弹窗显示撤销该消息后会影响的全部文件——包括该消息之后所有轮次的改动（不只是消息本轮的），并给出警告。
 - ✅ 确认后：
   - 恢复工作区文件到**发送该消息之前**的快照状态。
   - 通过 DSH 原生的 `sessionController.fork` 从该消息之前 fork 出新会话。
@@ -24,7 +24,7 @@ dsh plugin --profile <name> add dsh-turn-undo
 ## 使用
 
 1. 在对话中，每条用户消息的操作栏会出现撤销按钮。
-2. 点击按钮，弹窗列出本轮影响的文件。
+2. 点击按钮，弹窗列出撤销该消息后会影响的文件（该消息及之后所有轮次的改动）。
 3. 点击“确认恢复并继续”：
    - 文件恢复。
    - 旧会话被标记为 `（已撤销）`。
@@ -47,7 +47,7 @@ dsh plugin --profile <name> add dsh-turn-undo
   - 对“第一条用户消息”前面没有 completed turn 时，fall back 到 `ctx.sessionController.create({ cwd, agentPreset })` 创建空白会话。
   - 旧会话通过 `ctx.sessionController.rename` 加上 `（已撤销）` 前缀。
 - **HTTP API**：
-  - `GET /api/turn-undo?sessionId=...&messageSeq=...&promptText=...`：预览本轮影响。
+  - `GET /api/turn-undo?sessionId=...&messageSeq=...&promptText=...`：预览撤销该消息后会影响的文件（该消息之后所有轮次改动的并集）。
   - `POST /api/turn-undo`（body `{ sessionId, messageSeq, promptText }`）：执行恢复 + fork。
 
 ### 客户端（`client.js`）

@@ -53,11 +53,16 @@ writeFileSync(join(wsDir, 'a.txt'), 'alpha-v2', 'utf-8') // no real change
 let r3 = store.capture(wsDir, SESS, 3)
 assert(r3 === null || r3.skipped, 'unchanged turn yields null (no new snapshot)')
 
-// --- Preview picks the right snapshot ---
+// --- Preview lists EVERY change at/after the target turn (undo scope) ---
+// 撤销某条消息 = 回退该消息之后的所有改动。因此 preview 的影响范围是从
+// targetTurn 之前的最新快照（baseline）到会话最新快照（latest）之差。
+// 撤销 turn1：baseline={}（turn1 之前无快照）, latest=turn2 => a.txt+b.txt = 2。
 const prev = store.preview(SESS, 1)
-assert(prev.totalChanges === 1, 'preview turn1 lists the one file present at turn1')
+assert(prev.totalChanges === 2, 'preview undo-turn1 lists changes at/after turn1 (a.txt,b.txt)')
+assert(prev.changes.some(c => c.path === 'b.txt'), 'preview undo-turn1 includes later turn2 change (b.txt)')
+// 撤销 turn2：baseline=turn1（a.txt v1）, latest=turn2 => a.txt modified + b.txt created = 2。
 const prev2 = store.preview(SESS, 2)
-assert(prev2.totalChanges === 2, 'preview turn2 lists 2 changed files')
+assert(prev2.totalChanges === 2, 'preview undo-turn2 lists turn2 changes (2 files)')
 
 // --- Restore to turn 1: a.txt->v1, b.txt removed ---
 // Simulate further drift first.

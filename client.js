@@ -90,6 +90,7 @@ window.__ModuleLoader__.load({
           '.dtu-status{margin:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}',
           '.dtu-files{min-width:0;max-width:100%;box-sizing:border-box;max-height:220px;overflow:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:10px}',
           '.dtu-file{display:flex;justify-content:space-between;gap:16px;min-width:0;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12px}.dtu-file:last-child{border-bottom:0}',
+          '.dtu-more{display:flex;justify-content:center;gap:8px;padding:8px 10px;font-size:12px;color:var(--dsw-alias-label-tertiary)}',
           '.dtu-file code{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary)}',
           '.dtu-kind{flex:none;color:var(--dsw-alias-label-tertiary)}',
           '.dtu-warning,.dtu-error{box-sizing:border-box;max-width:100%;margin:0;padding:10px 12px;overflow-wrap:anywhere;word-break:break-word;border-radius:10px;font-size:12px;line-height:18px}',
@@ -329,7 +330,7 @@ window.__ModuleLoader__.load({
             ),
           ),
           open ? h(RestoreDialog, {
-            sessionId: sessionId, messageText: messageText, turn: messageSeq,
+            sessionId: sessionId, messageText: messageText,
             onClose: close, preview: preview, loading: loading, error: error,
             applying: applying, done: done, changes: changes,
             previewError: previewError, noSnapshot: noSnapshot, canApply: canApply, applyRestore: applyRestore,
@@ -340,7 +341,6 @@ window.__ModuleLoader__.load({
       function RestoreDialog(props) {
         var sessionId = props.sessionId
         var messageText = props.messageText
-        var turn = props.turn
         var onClose = props.onClose
         var preview = props.preview
         var loading = props.loading
@@ -352,6 +352,13 @@ window.__ModuleLoader__.load({
         var noSnapshot = props.noSnapshot
         var canApply = props.canApply
         var applyRestore = props.applyRestore
+
+        // 文件很多时避免一次性渲染大量 DOM（性能优化）：只渲染前 200 个，
+        // 其余折叠成一条提示。总数仍在标题里显示。
+        var MAX_PREVIEW_FILES = 200
+        var shownChanges = changes.length > MAX_PREVIEW_FILES
+          ? changes.slice(0, MAX_PREVIEW_FILES)
+          : changes
 
         return reactDom.createPortal(
           h('div', { className: 'dtu-overlay', onClick: onClose },
@@ -377,12 +384,16 @@ window.__ModuleLoader__.load({
                   ? h('div', { className: 'dtu-section' },
                       h('div', { className: 'dtu-section-label' }, '将影响的文件 (' + changes.length + ' 个)'),
                       h('div', { className: 'dtu-files' },
-                        changes.map(function (change, idx) {
+                        shownChanges.map(function (change, idx) {
                           return h('div', { key: idx, className: 'dtu-file' },
                             h('code', {}, change.path),
                             h('span', { className: 'dtu-kind' }, kindLabel(change.kind)),
                           )
                         }),
+                        (changes.length > shownChanges.length)
+                          ? h('div', { className: 'dtu-more' },
+                              '… 还有 ' + (changes.length - shownChanges.length) + ' 个文件未显示'
+                            ) : null,
                       ),
                     ) : null,
                 (!loading && !previewError && changes.length > 0)
