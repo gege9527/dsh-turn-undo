@@ -106,16 +106,14 @@ window.__ModuleLoader__.load({
           '.dtu-fullscreen-back{background:transparent;border:0;font-size:14px;cursor:pointer;color:var(--dsw-alias-label-secondary);padding:6px 10px;border-radius:6px}.dtu-fullscreen-back:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
           '.dtu-fullscreen-path{font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
           '.dtu-fullscreen-close{background:transparent;border:0;font-size:24px;cursor:pointer;color:var(--dsw-alias-label-tertiary);padding:4px 8px;border-radius:6px}.dtu-fullscreen-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
-          '.dtu-fullscreen-body{flex:1;display:flex;overflow:hidden}',
-          '.dtu-diff-column{flex:1;display:flex;flex-direction:column;overflow:hidden}',
-          '.dtu-diff-column:first-child{border-right:3px solid var(--dsw-alias-border-l2)}',
-          '.dtu-diff-column-header{padding:8px 16px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);border-bottom:1px solid var(--dsw-alias-border-l2);text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}',
-          '.dtu-diff-column-content{flex:1;overflow:auto;padding:0;position:relative}',
-          '.dtu-diff-line{font-family:monospace;font-size:13px;line-height:21px;padding:1px 16px 1px 56px;white-space:pre-wrap;word-break:break-all;height:21px;position:relative}',
-          '.dtu-diff-line-num{position:absolute;left:8px;top:0;width:40px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px;pointer-events:none}',
-          '.dtu-diff-removed{background:rgba(248,81,73,.12);color:#f85149}',
-          '.dtu-diff-added{background:rgba(63,185,80,.12);color:#39b54e}',
-          '.dtu-diff-same{color:var(--dsw-alias-label-primary)}',
+          '.dtu-fullscreen-body{flex:1;display:flex;flex-direction:column;overflow:hidden}',
+          '.dtu-diff-scroll-area{flex:1;overflow:auto}',
+          '.dtu-diff-line{font-family:monospace;font-size:13px;line-height:21px;height:21px;padding:0 48px 0 48px;display:flex;white-space:pre-wrap;word-break:break-all}',
+          '.dtu-diff-gutter{position:absolute;left:0;top:0;width:44px;padding:0 4px;display:flex;align-items:center;justify-content:flex-end;pointer-events:none}',
+          '.dtu-diff-marker{width:14px;text-align:right;font-weight:700;font-size:14px}',
+          '.dtu-diff-num{width:26px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px}',
+          '.dtu-diff-removed{background:rgba(248,81,73,.12);color:#f85149}.dtu-diff-removed .dtu-diff-marker{color:#f85149}',
+          '.dtu-diff-added{background:rgba(63,185,80,.12);color:#39b54e}.dtu-diff-added .dtu-diff-marker{color:#39b54e}',
           '.dtu-diff-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--dsw-alias-label-tertiary);font-size:14px}',
         ].join('')
         document.head.appendChild(styleEl)
@@ -356,76 +354,50 @@ window.__ModuleLoader__.load({
       }
 
       // Full-screen diff overlay component
+      // Full-screen single-column diff overlay — shows ONLY changed lines
       function DiffOverlay(props) {
         var onClose = props.onClose
         var change = props.change
         
-        // Build left/right line arrays
-        var showLeft = change.kind === 'deleted' || change.kind === 'modified'
-        var showRight = change.kind === 'created' || change.kind === 'modified'
-        var leftLines = []
-        var rightLines = []
-
+        // Build diff rows: only show removed/added lines, not same lines
+        var diffRows = []
+        
         if (change.diff && change.diff.hunks) {
           var hunks = change.diff.hunks
-          if (showLeft && showRight) {
-            // Modified file: align hunks into left/right pairs
-            for (var i = 0; i < hunks.length; i++) {
-              var hunk = hunks[i]
-              if (hunk.type === 'removed') {
-                leftLines.push({ type: 'removed', text: hunk.value })
-                rightLines.push(null)
-              } else if (hunk.type === 'added') {
-                leftLines.push(null)
-                rightLines.push({ type: 'added', text: hunk.value })
-              } else {
-                leftLines.push({ type: 'same', text: hunk.value })
-                rightLines.push({ type: 'same', text: hunk.value })
-              }
-            }
-          } else if (change.kind === 'created') {
-            // Only right panel for created files
-            for (var j = 0; j < hunks.length; j++) {
-              var hunkJ = hunks[j]
-              rightLines.push({ type: hunkJ.type === 'same' ? 'same' : 'added', text: hunkJ.value })
-            }
-          } else if (change.kind === 'deleted') {
-            // Only left panel for deleted files
-            for (var k = 0; k < hunks.length; k++) {
-              var hunkK = hunks[k]
-              leftLines.push({ type: hunkK.type === 'same' ? 'same' : 'removed', text: hunkK.value })
+          var originalLine = 1
+          var newLine = 1
+          
+          for (var i = 0; i < hunks.length; i++) {
+            var hunk = hunks[i]
+            
+            if (hunk.type === 'removed') {
+              diffRows.push({
+                type: 'removed',
+                text: hunk.value,
+                oldLine: originalLine,
+                newLine: null
+              })
+              originalLine++
+            } else if (hunk.type === 'added') {
+              diffRows.push({
+                type: 'added',
+                text: hunk.value,
+                oldLine: null,
+                newLine: newLine
+              })
+              newLine++
+            } else {
+              // same line — skip, but track line numbers
+              originalLine++
+              newLine++
             }
           }
         }
-
-        var leftTitle = showLeft ? (change.kind === 'deleted' ? '已删除（原内容）' : '原始版本') : ''
-        var rightTitle = showRight ? (change.kind === 'created' ? '已创建（新内容）' : '修改后版本') : ''
-
-        // Helper to render a column with line numbers
-        function renderColumn(lines, title) {
-          var numberedLines = lines.map(function (line, idx) {
-            return { num: idx + 1, line: line }
-          })
-          return h('div', { className: 'dtu-diff-column' },
-            title ? h('div', { className: 'dtu-diff-column-header' }, title) : null,
-            h('div', { className: 'dtu-diff-column-content' },
-              numberedLines.length > 0
-                ? h('div', null, numberedLines.map(function (item, idx) {
-                    var line = item.line
-                    if (!line) return null
-                    return h('div', {
-                      key: idx,
-                      className: 'dtu-diff-line dtu-diff-' + line.type,
-                    },
-                      h('span', { className: 'dtu-diff-line-num' }, item.num),
-                      line.text
-                    )
-                  }))
-                : h('div', { className: 'dtu-diff-empty' }, '(无内容)')
-            )
-          )
-        }
-
+        
+        // For created/deleted files, adjust line numbering
+        var isCreated = change.kind === 'created'
+        var isDeleted = change.kind === 'deleted'
+        
         return reactDom.createPortal(
           h('div', {
             className: 'dtu-fullscreen-diff',
@@ -441,8 +413,10 @@ window.__ModuleLoader__.load({
               }, '← 关闭'),
               h('span', { className: 'dtu-fullscreen-path' }, change.path),
               h('div', null,
-                showLeft ? h('span', { style: { color: '#f85149', fontSize: '11px', marginRight: '12px' } }, '● 原始') : null,
-                showRight ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 修改') : null
+                isCreated ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 新文件') : null,
+                isDeleted ? h('span', { style: { color: '#f85149', fontSize: '11px' } }, '● 已删除') : null,
+                (!isCreated && !isDeleted) ? h('span', { style: { color: '#f85149', fontSize: '11px', marginRight: '8px' } }, '● 删除') : null,
+                (!isCreated && !isDeleted) ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 添加') : null
               ),
               h('button', {
                 className: 'dtu-fullscreen-close',
@@ -450,8 +424,23 @@ window.__ModuleLoader__.load({
               }, '✕')
             ),
             h('div', { className: 'dtu-fullscreen-body' },
-              renderColumn(leftLines, leftTitle),
-              renderColumn(rightLines, rightTitle)
+              h('div', { className: 'dtu-diff-scroll-area' },
+                diffRows.length > 0
+                  ? h('div', null, diffRows.map(function (row, idx) {
+                      var lineClass = 'dtu-diff-line dtu-diff-' + row.type
+                      var leftMark = row.type === 'removed' ? '-' : (row.type === 'added' ? '+' : ' ')
+                      var leftNumber = row.type === 'removed' ? (isCreated ? '' : String(row.oldLine)) : (isCreated ? String(row.newLine) : '')
+                      
+                      return h('div', { key: idx, className: lineClass },
+                        h('span', { className: 'dtu-diff-gutter' },
+                          h('span', { className: 'dtu-diff-marker' }, leftMark),
+                          h('span', { className: 'dtu-diff-num' }, leftNumber)
+                        ),
+                        row.text
+                      )
+                    }))
+                  : h('div', { className: 'dtu-diff-empty' }, '(无差异)')
+              )
             )
           ),
           document.body
@@ -509,6 +498,7 @@ window.__ModuleLoader__.load({
                   ? h('div', { className: 'dtu-section' },
                       h('div', { className: 'dtu-section-label' }, '将影响的文件 (' + changes.length + ' 个)'),
                       h('div', { className: 'dtu-files' },
+                        h('div', { className: 'dtu-files' },
                           shownChanges.map(function (change, idx) {
                             var isModified = change.kind === 'modified' && change.diff
                             return h('div', {
