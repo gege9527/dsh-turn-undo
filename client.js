@@ -509,7 +509,6 @@ window.__ModuleLoader__.load({
                   ? h('div', { className: 'dtu-section' },
                       h('div', { className: 'dtu-section-label' }, '将影响的文件 (' + changes.length + ' 个)'),
                       h('div', { className: 'dtu-files' },
-                        h('div', { className: 'dtu-files' },
                           shownChanges.map(function (change, idx) {
                             var isModified = change.kind === 'modified' && change.diff
                             return h('div', {
