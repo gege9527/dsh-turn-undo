@@ -1165,10 +1165,23 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
   const baselineContents = this.readManifestContents(baselineManifest)
   const latestContents = this.readManifestContents(latestManifest)
   
+  const deleted = []
+  const created = []
+
+  // Collect deleted files
+  for (const rel of Object.keys(baselineManifest)) {
+    if (!latestManifest[rel]) {
+      changes.push({ path: rel, kind: 'deleted' })
+      deleted.push({ path: rel, hash: baselineManifest[rel].hash })
+    }
+  }
+
+  // Collect created and modified files
   for (const rel of Object.keys(latestManifest)) {
     const entry = latestManifest[rel]
     if (!baselineManifest[rel]) {
       changes.push({ path: rel, kind: 'created' })
+      created.push({ path: rel, hash: entry.hash })
     } else {
       const prevEntry = baselineManifest[rel]
       if (entry.hash !== prevEntry.hash) {
@@ -1186,9 +1199,13 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
     }
   }
 
-  for (const rel of Object.keys(baselineManifest)) {
-    if (!latestManifest[rel]) {
-      changes.push({ path: rel, kind: 'deleted' })
+  // Detect rename/move: same content hash, different path
+  for (let i = 0; i < deleted.length; i++) {
+    for (let j = 0; j < created.length; j++) {
+      if (deleted[i].hash === created[j].hash) {
+        deleted[i].matched = true
+        created[j].matched = true
+      }
     }
   }
 
@@ -1198,5 +1215,9 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
     targetTurn,
     totalChanges: changes.length,
     changes,
+    renameMap: deleted.filter(d => d.matched).map(d => ({ 
+      oldPath: d.path, 
+      newPath: created.find(c => c.matched)?.path 
+    })).filter(Boolean),
   }
 }
