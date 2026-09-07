@@ -70,49 +70,49 @@ window.__ModuleLoader__.load({
       var useEffect = react.useEffect
       var useLayoutEffect = react.useLayoutEffect
 
+      // CodeMirror 加载器
+      var codemirrorLoaded = null
+      function loadCodeMirror() {
+        if (codemirrorLoaded) return codemirrorLoaded
+        codemirrorLoaded = new Promise(function (resolve, reject) {
+          if (window.CodeMirror) { resolve(window.CodeMirror); return; }
+          var link = document.createElement('link')
+          link.rel = 'stylesheet'
+          link.href = 'https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.css'
+          link.onload = function () {
+            var script = document.createElement('script')
+            script.src = 'https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.js'
+            script.onload = function () { resolve(window.CodeMirror); }
+            script.onerror = function () { reject(new Error('CodeMirror load failed')); }
+            document.head.appendChild(script)
+          }
+          link.onerror = function () { reject(new Error('CodeMirror CSS load failed')); }
+          document.head.appendChild(link)
+        })
+        return codemirrorLoaded
+      }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+      // 根据文件扩展名猜测语言模式
+      function guessLanguage(filename) {
+        var ext = ''
+        var lastDot = filename.lastIndexOf('.')
+        if (lastDot >= 0) ext = filename.substring(lastDot + 1).toLowerCase()
+        var modeMap = {
+          js: 'javascript', ts: 'javascript', jsx: 'jsx', tsx: 'jsx',
+          py: 'python', java: 'java', c: 'text/x-csrc', cpp: 'text/x-c++src',
+          h: 'text/x-c', hpp: 'text/x-c++hdr',
+          go: 'text/x-go', rs: 'text/x-rustsrc', rb: 'text/x-ruby',
+          php: 'text/x-php', swift: 'swift', kt: 'text/x-kotlin',
+          html: 'text/html', htm: 'text/html',
+          css: 'text/css', scss: 'text/x-scss', less: 'text/x-less',
+          json: 'application/json', xml: 'application/xml', yaml: 'text/x-yaml', yml: 'text/x-yaml',
+          md: 'markdown', sh: 'shell', bash: 'shell', zsh: 'shell',
+          sql: 'text/x-sql', toml: 'text/x-toml', ini: 'text/x-ini',
+          dockerfile: 'text/x-dockerfile',
+          default: 'text/plain'
+        }
+        return modeMap[ext] || modeMap.default
+      }
 
       var STYLE_ID = 'dsh-turn-undo'
       if (!document.getElementById('dsh-turn-undo-styles')) {
@@ -151,13 +151,17 @@ window.__ModuleLoader__.load({
           '.dtu-fullscreen-path{font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
           '.dtu-fullscreen-close{background:transparent;border:0;font-size:24px;cursor:pointer;color:var(--dsw-alias-label-tertiary);padding:4px 8px;border-radius:6px}.dtu-fullscreen-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
           '.dtu-fullscreen-body{flex:1;display:flex;flex-direction:column;overflow:hidden}',
-          '.dtu-diff-scroll-area{flex:1;overflow:auto}',
-          '.dtu-diff-line{font-family:monospace;font-size:13px;line-height:21px;height:21px;padding:0 48px 0 48px;display:flex;white-space:pre-wrap;word-break:break-all}',
-          '.dtu-diff-gutter{position:absolute;left:0;top:0;width:44px;padding:0 4px;display:flex;align-items:center;justify-content:flex-end;pointer-events:none}',
-          '.dtu-diff-marker{width:14px;text-align:right;font-weight:700;font-size:14px}',
-          '.dtu-diff-num{width:26px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px}',
-          '.dtu-diff-removed{background:rgba(248,81,73,.12);color:#f85149}.dtu-diff-removed .dtu-diff-marker{color:#f85149}',
-          '.dtu-diff-added{background:rgba(63,185,80,.12);color:#39b54e}.dtu-diff-added .dtu-diff-marker{color:#39b54e}',
+          '.dtu-diff-columns-wrapper{display:flex;padding:0 16px 8px;font-size:11px;font-weight:600;color:var(--dsw-alias-label-tertiary);text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}',
+          '.dtu-diff-column-label{flex:1;text-align:center;border-bottom:1px solid var(--dsw-alias-border-l2);padding-bottom:4px}',
+          '.dtu-diff-scroll-container{flex:1;overflow:auto}',
+          '.dtu-diff-row{display:flex;border-bottom:1px solid var(--dsw-alias-border-l1);min-height:21px}',
+          '.dtu-diff-row-removed{background:rgba(248,81,73,.15)}',
+          '.dtu-diff-row-added{background:rgba(63,185,80,.15)}',
+          '.dtu-diff-cell{flex:1;font-family:monospace;font-size:13px;line-height:21px;padding:0 8px 0 52px;display:flex;white-space:pre-wrap;word-break:break-all;position:relative}',
+          '.dtu-diff-cell-removed{color:#f85149}',
+          '.dtu-diff-cell-added{color:#39b54e}',
+          '.dtu-diff-line-num{position:absolute;left:4px;top:0;width:44px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px;pointer-events:none;padding-right:4px}',
+          '.dtu-diff-line-num-empty{visibility:hidden}',
           '.dtu-diff-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--dsw-alias-label-tertiary);font-size:14px}',
         ].join('')
         document.head.appendChild(styleEl)
@@ -397,176 +401,172 @@ window.__ModuleLoader__.load({
         )
       }
 
-      // Full-screen diff overlay component
-      // Full-screen single-column diff overlay — shows ONLY changed lines
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-      function RestoreDialog(props) {
+      // Full-screen VSCode-style diff overlay — side-by-side with single scrollbar
+      function DiffOverlay(props) {
+        var onClose = props.onClose
+        var change = props.change
+        var oldEditorRef = reactDom.createRef()
+        var newEditorRef = reactDom.createRef()
+        
+        var isCreated = change.kind === 'created'
+        var isDeleted = change.kind === 'deleted'
+        var isModified = change.kind === 'modified'
+        
+        // 构建左右内容
+        var leftContent = ''
+        var rightContent = ''
+        var language = guessLanguage(change.path)
+        
+        if (change.diff && change.diff.hunks) {
+          var leftLines = []
+          var rightLines = []
+          
+          if (isModified) {
+            // 修改的文件：显示旧 vs 新
+            for (var i = 0; i < change.diff.hunks.length; i++) {
+              var hunk = change.diff.hunks[i]
+              if (hunk.type === 'removed') {
+                leftLines.push(hunk.value)
+              } else if (hunk.type === 'added') {
+                rightLines.push(hunk.value)
+              } else {
+                leftLines.push(hunk.value)
+                rightLines.push(hunk.value)
+              }
+            }
+          } else if (isCreated) {
+            // 新建文件：只显示新内容
+            for (var j = 0; j < change.diff.hunks.length; j++) {
+              var hunkJ = change.diff.hunks[j]
+              if (hunkJ.type === 'same' || hunkJ.type === 'added') {
+                rightLines.push(hunkJ.value)
+              }
+            }
+          } else if (isDeleted) {
+            // 删除文件：只显示旧内容
+            for (var k = 0; k < change.diff.hunks.length; k++) {
+              var hunkK = change.diff.hunks[k]
+              if (hunkK.type === 'same' || hunkK.type === 'removed') {
+                leftLines.push(hunkK.value)
+              }
+            }
+          }
+          
+          leftContent = leftLines.join('\n')
+          rightContent = rightLines.join('\n')
+        }
+        
+        // 初始化 CodeMirror 编辑器
+        useEffect(function () {
+          var mounted = true
+          var leftEditor = null
+          var rightEditor = null
+          
+          loadCodeMirror().then(function (cm) {
+            if (!mounted) return
+            
+            // 加载主题
+            var themeLink = document.getElementById('codemirror-theme')
+            if (!themeLink) {
+              themeLink = document.createElement('link')
+              themeLink.id = 'codemirror-theme'
+              themeLink.rel = 'stylesheet'
+              themeLink.href = 'https://cdn.jsdelivr.net/npm/codemirror@5.65.16/theme/material-darker.css'
+              document.head.appendChild(themeLink)
+            }
+            
+            // 创建左边编辑器（原始版本）
+            if (oldEditorRef.current && leftContent) {
+              leftEditor = cm.fromTextArea(oldEditorRef.current, {
+                mode: language,
+                theme: 'material-darker',
+                lineNumbers: true,
+                lineWrapping: true,
+                readOnly: true,
+                viewportMargin: Infinity
+              })
+              leftEditor.setValue(leftContent)
+            }
+            
+            // 创建右边编辑器（修改后版本）
+            if (newEditorRef.current && rightContent) {
+              rightEditor = cm.fromTextArea(newEditorRef.current, {
+                mode: language,
+                theme: 'material-darker',
+                lineNumbers: true,
+                lineWrapping: true,
+                readOnly: true,
+                viewportMargin: Infinity
+              })
+              rightEditor.setValue(rightContent)
+            }
+            
+            // 同步滚动
+            if (leftEditor && rightEditor) {
+              leftEditor.on('scroll', function () {
+                var info = leftEditor.getScrollInfo()
+                rightEditor.scrollTo(info.left, info.top)
+              })
+              rightEditor.on('scroll', function () {
+                var info = rightEditor.getScrollInfo()
+                leftEditor.scrollTo(info.left, info.top)
+              })
+            }
+          })
+          
+          return function () {
+            mounted = false
+            if (leftEditor) { leftEditor.toTextArea(); }
+            if (rightEditor) { rightEditor.toTextArea(); }
+          }
+        }, [])
+        
+        var leftLabel = isCreated ? '' : '原始版本'
+        var rightLabel = isDeleted ? '' : '修改后版本'
+        
+        return reactDom.createPortal(
+          h('div', {
+            className: 'dtu-fullscreen-diff',
+            onClick: onClose,
+            onKeyDown: function (e) {
+              if (e.key === 'Escape') onClose()
+            }
+          },
+            h('div', { className: 'dtu-fullscreen-header', onClick: function (e) { e.stopPropagation() } },
+              h('button', {
+                className: 'dtu-fullscreen-back',
+                onClick: onClose
+              }, '← 关闭'),
+              h('span', { className: 'dtu-fullscreen-path' }, change.path),
+              h('div', null,
+                isCreated ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 新文件') : null,
+                isDeleted ? h('span', { style: { color: '#f85149', fontSize: '11px' } }, '● 已删除') : null,
+                isModified ? h('span', { style: { color: '#f85149', fontSize: '11px', marginRight: '8px' } }, '● 删除') : null,
+                isModified ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 添加') : null
+              ),
+              h('button', {
+                className: 'dtu-fullscreen-close',
+                onClick: onClose
+              }, '✕')
+            ),
+            h('div', { className: 'dtu-fullscreen-body' },
+              h('div', { className: 'dtu-diff-columns-wrapper' },
+                leftLabel ? h('div', { className: 'dtu-diff-column-label' }, leftLabel) : null,
+                rightLabel ? h('div', { className: 'dtu-diff-column-label' }, rightLabel) : null
+              ),
+              h('div', { style: { flex: 1, display: 'flex', overflow: 'hidden' } },
+                h('div', { style: { flex: 1, overflow: 'hidden', borderRight: '1px solid var(--dsw-alias-border-l2)' } },
+                  h('textarea', { ref: oldEditorRef, style: { display: 'none' } })
+                ),
+                h('div', { style: { flex: 1, overflow: 'hidden' } },
+                  h('textarea', { ref: newEditorRef, style: { display: 'none' } })
+                )
+              )
+            )
+          ),
+          document.body
+        )
+      }function RestoreDialog(props) {
         var sessionId = props.sessionId
         var messageText = props.messageText
         var onClose = props.onClose
