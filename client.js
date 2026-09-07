@@ -101,15 +101,17 @@ window.__ModuleLoader__.load({
           '.dtu-btn-cancel{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}.dtu-btn-cancel:hover{background:var(--dsw-alias-interactive-bg-hover)}',
           '.dtu-btn-primary{background:var(--dsw-alias-state-business-primary);color:#fff;font-weight:500;min-width:120px}.dtu-btn-primary:hover{opacity:.9}.dtu-btn-primary:disabled{opacity:.5;cursor:not-allowed}',
           '.dtu-file{cursor:pointer}.dtu-file:hover{background:var(--dsw-alias-bg-layer-3)}',
-          '.dtu-diff{max-height:400px;overflow:auto;font-family:monospace;font-size:12px;line-height:1.5;margin-top:12px;padding:8px;background:var(--dsw-alias-bg-layer-2);border-radius:6px}',
-          '.dtu-diff-line{white-space:pre-wrap;word-break:break-all}',
-          '.dtu-diff-removed{background:rgba(248,81,73,.15);color:#f85149}.dtu-diff-removed::before{content:"- ";opacity:.6}',
-          '.dtu-diff-added{background:rgba(63,185,80,.15);color:#39b54e}.dtu-diff-added::before{content:"+ ";opacity:.6}',
-          '.dtu-diff-same{color:var(--dsw-alias-label-tertiary)}.dtu-diff-same::before{content:"  "}',
-          '.dtu-diff-hunk{color:var(--dsw-alias-label-secondary);font-size:11px;margin-bottom:4px}',
-          '.dtu-diff-close{float:right;background:transparent;border:0;font-size:18px;cursor:pointer;color:var(--dsw-alias-label-secondary)}',
-          '.dtu-diff-close:hover{color:var(--dsw-alias-label-primary)}',
-          '.dtu-diff-file{font-weight:600;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--dsw-alias-border-color)}',
+          '.dtu-diff-viewer{max-height:calc(100vh - 120px);display:flex;gap:0;margin-top:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;overflow:hidden}',
+          '.dtu-diff-panel{flex:1;overflow:auto;background:var(--dsw-alias-bg-layer-2)}',
+          '.dtu-diff-panel:first-child{border-right:2px solid var(--dsw-alias-border-l1)}',
+          '.dtu-diff-panel-header{position:sticky;top:0;background:var(--dsw-alias-bg-layer-3);padding:8px 12px;font-size:13px;font-weight:600;color:var(--dsw-alias-label-secondary);border-bottom:1px solid var(--dsw-alias-border-l2);z-index:1}',
+          '.dtu-diff-line{font-family:monospace;font-size:14px;line-height:20px;padding:2px 12px;white-space:pre-wrap;word-break:break-all;min-height:20px}',
+          '.dtu-diff-removed{background:rgba(248,81,73,.12);color:#f85149}.dtu-diff-removed::before{content:"- ";color:#f85149;font-weight:700}',
+          '.dtu-diff-added{background:rgba(63,185,80,.12);color:#39b54e}.dtu-diff-added::before{content:"+ ";color:#39b54e;font-weight:700}',
+          '.dtu-diff-same{color:var(--dsw-alias-label-secondary)}.dtu-diff-same::before{content:" "}',
+          '.dtu-diff-empty{text-align:center;padding:40px;color:var(--dsw-alias-label-tertiary);font-size:14px}',
+          '.dtu-diff-header{display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+          '.dtu-diff-close{background:transparent;border:0;font-size:20px;cursor:pointer;color:var(--dsw-alias-label-tertiary);padding:4px 8px;border-radius:4px}.dtu-diff-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
         ].join('')
         document.head.appendChild(styleEl)
       }
@@ -348,6 +350,71 @@ window.__ModuleLoader__.load({
         )
       }
 
+      // Diff viewer component — left=original, right=modified
+      function DiffViewer(props) {
+        var change = props.change
+        var kindLabel = props.kindLabel
+
+        // Determine panel configuration based on change kind
+        var showLeft = change.kind === 'deleted' || change.kind === 'modified'
+        var showRight = change.kind === 'created' || change.kind === 'modified'
+
+        // For modified files, align hunks into left/right pairs
+        var leftLines = []
+        var rightLines = []
+
+        if (showLeft && showRight && change.diff && change.diff.hunks) {
+          var hunks = change.diff.hunks
+          for (var i = 0; i < hunks.length; i++) {
+            var hunk = hunks[i]
+            if (hunk.type === 'removed') {
+              leftLines.push({ type: 'removed', text: hunk.value })
+              rightLines.push(null) // gap on right
+            } else if (hunk.type === 'added') {
+              leftLines.push(null) // gap on left
+              rightLines.push({ type: 'added', text: hunk.value })
+            } else {
+              leftLines.push({ type: 'same', text: hunk.value })
+              rightLines.push({ type: 'same', text: hunk.value })
+            }
+          }
+        } else if (change.kind === 'created' && change.diff && change.diff.hunks) {
+          // Only right panel for created files
+          for (var j = 0; j < change.diff.hunks.length; j++) {
+            var hunkJ = change.diff.hunks[j]
+            rightLines.push({ type: hunkJ.type === 'same' ? 'same' : 'added', text: hunkJ.value })
+          }
+        } else if (change.kind === 'deleted' && change.diff && change.diff.hunks) {
+          // Only left panel for deleted files
+          for (var k = 0; k < change.diff.hunks.length; k++) {
+            var hunkK = change.diff.hunks[k]
+            leftLines.push({ type: hunkK.type === 'same' ? 'same' : 'removed', text: hunkK.value })
+          }
+        }
+
+        var leftTitle = showLeft ? (change.kind === 'deleted' ? '已删除（原内容）' : '原始版本') : ''
+        var rightTitle = showRight ? (change.kind === 'created' ? '已创建（新内容）' : '修改后版本') : ''
+
+        return h('div', { className: 'dtu-diff-viewer' },
+          showLeft ? h('div', { className: 'dtu-diff-panel' },
+            leftTitle ? h('div', { className: 'dtu-diff-panel-header' }, leftTitle) : null,
+            leftLines.length > 0
+              ? h('div', null, leftLines.map(function (line, idx) {
+                  return line ? h('div', { key: idx, className: 'dtu-diff-line dtu-diff-' + line.type }, line.text) : null
+                }))
+              : h('div', { className: 'dtu-diff-empty' }, '(无内容)')
+          ) : null,
+          showRight ? h('div', { className: 'dtu-diff-panel' },
+            rightTitle ? h('div', { className: 'dtu-diff-panel-header' }, rightTitle) : null,
+            rightLines.length > 0
+              ? h('div', null, rightLines.map(function (line, idx) {
+                  return line ? h('div', { key: idx, className: 'dtu-diff-line dtu-diff-' + line.type }, line.text) : null
+                }))
+              : h('div', { className: 'dtu-diff-empty' }, '(无内容)')
+          ) : null
+        )
+      }
+
       function RestoreDialog(props) {
         var sessionId = props.sessionId
         var messageText = props.messageText
@@ -414,19 +481,17 @@ window.__ModuleLoader__.load({
                         }),
                         viewingDiff
                           ? h('div', { className: 'dtu-section' },
-                              h('div', { className: 'dtu-diff-file' }, viewingDiff.path),
-                              h('button', {
-                                className: 'dtu-diff-close',
-                                onClick: function () { showDiff(null) }
-                              }, '✕'),
-                              h('div', { className: 'dtu-diff' },
-                                viewingDiff.diff.hunks.map(function (hunk, hIdx) {
-                                  var className = hunk.type === 'removed' ? 'dtu-diff-removed'
-                                  : hunk.type === 'added' ? 'dtu-diff-added'
-                                  : 'dtu-diff-same'
-                                  return h('div', { key: hIdx, className: 'dtu-diff-line ' + className }, hunk.value)
-                                })
-                              )
+                              h('div', { className: 'dtu-diff-header' },
+                                h('span', { className: 'dtu-diff-file' }, viewingDiff.path),
+                                h('button', {
+                                  className: 'dtu-diff-close',
+                                  onClick: function () { showDiff(null) }
+                                }, '✕')
+                              ),
+                              h(DiffViewer, { 
+                                change: viewingDiff, 
+                                kindLabel: kindLabel 
+                              })
                             )
                           : null,
                         (changes.length > shownChanges.length)
