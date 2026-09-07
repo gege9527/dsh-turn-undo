@@ -28,7 +28,7 @@ import {
   readdirSync,
   readlinkSync,
   rmSync,
-  linkSync,
+  chmodSync,
   createWriteStream,
   createReadStream,
 } from 'node:fs'
@@ -195,7 +195,7 @@ class SnapshotStore {
    * Capture the workspace at cwd into the session's chain.
    * Returns the manifest (or null if unchanged since the session's last).
    */
-  capture(cwd, sessionId, turn) {
+  async capture(cwd, sessionId, turn) {
     ensureDir(this.objDir)
     ensureDir(join(this.snapDir, sessionId))
 
@@ -229,13 +229,15 @@ class SnapshotStore {
       // Reuse previous object if content unchanged (compare size+mtime via
       // prev manifest, else re-hash the file).
       const prev = prevManifest && prevManifest[rel]
-      if (prev && prev.size === st.size && prev.mtime === st.mtimeMs) {
+      const prevMode = prev && prev.mode
+      const currentMode = st.mode.toString(8).padStart(4, '0')
+      if (prev && prev.size === st.size && prev.mtime === st.mtimeMs && prevMode === currentMode) {
         entry = prev // unchanged — reuse (no new object written)
       } else {
         const hash = hashFile(abs)
         const objPath = join(this.objDir, hash)
         if (!existsSync(objPath)) {
-          this.copyIntoObjects(abs, objPath)
+          await this.copyIntoObjects(abs, objPath)
         }
         entry = {
           kind: 'file',
@@ -355,37 +357,46 @@ class SnapshotStore {
    * where the newly-materialized file is immediately superseded by the next
    * turn's capture and there is no long-lived object to corrupt.
    */
-  copyIntoObjects(src, dst) {
+  async copyIntoObjects(src, dst) {
+    let success = false
     try {
       copyFileSync(src, dst)
+      success = true
     } catch {
       // e.g. src vanished mid-read; try streaming fallback
       try {
         const rs = createReadStream(src)
         const ws = createWriteStream(dst)
-        rs.pipe(ws)
-        return new Promise((resolve, reject) => {
+        await new Promise((resolve, reject) => {
           rs.on('error', reject)
           ws.on('error', reject)
           ws.on('finish', resolve)
         })
+        success = true
       } catch (e) {
         console.warn('[turn-undo] object write failed:', e.message)
+      }
+    }
+    // Verify the written object hash matches the source
+    if (success) {
+      const srcHash = hashFile(src)
+      const dstHash = hashFile(dst)
+      if (srcHash !== dstHash) {
+        // Hash mismatch — file was corrupted during copy
+        try { unlinkSync(dst) } catch {}
+        throw new Error(`Object hash mismatch: expected ${srcHash}, got ${dstHash}`)
       }
     }
   }
 
   /** Materialize an object into the workspace (write-back during restore). */
-  materializeObject(objPath, dest) {
+  materializeObject(objPath, dest, mode) {
     try {
       unlinkSync(dest)
     } catch { /* may not exist */ }
     ensureDir(dirname(dest))
-    try {
-      linkSync(objPath, dest) // hard link back: cheap + safe (object won't be re-modified)
-    } catch {
-      copyFileSync(objPath, dest)
-    }
+    copyFileSync(objPath, dest)
+    if (mode) chmodSync(dest, parseInt(mode, 8))
   }
 
   manifestsEqual(a, b) {
@@ -398,6 +409,7 @@ class SnapshotStore {
       if (!eb) return false
       if (ea.kind !== eb.kind) return false
       if (ea.hash !== eb.hash) return false
+      if (ea.mode !== eb.mode) return false
     }
     return true
   }
@@ -439,6 +451,7 @@ class SnapshotStore {
 
     let restoredFiles = 0
     let deletedFiles = 0
+    const skippedFiles = [] // Track files that couldn't be restored
     // 1. Write back / refresh files present in target manifest.
     for (const rel of rels) {
       const entry = manifest[rel]
@@ -448,12 +461,15 @@ class SnapshotStore {
         ensureDir(dirname(abs))
         if (entry.kind === 'file') {
           const objPath = join(this.objDir, entry.hash)
-          if (!existsSync(objPath)) continue
-          this.materializeObject(objPath, abs)
+          if (!existsSync(objPath)) {
+            skippedFiles.push({ path: rel, reason: 'object_missing' })
+            continue
+          }
+          this.materializeObject(objPath, abs, entry.mode)
           restoredFiles++
         }
       } catch (e) {
-        /* skip un-restorable files */
+        skippedFiles.push({ path: rel, reason: 'materialize_failed', error: e.message })
       }
     }
 
@@ -461,6 +477,7 @@ class SnapshotStore {
     //    except excluded dirs. Only within cwd. Uses a boundary-unlimited walk
     //    (unlike scan, whose caps would silently stop the pruning early).
     const current = this.walkAll(cwd, ignore)
+    const failedDeletions = []
     for (const abs of current) {
       if (ignore(abs)) continue
       const rel = relative(cwd, abs).split('\\').join('/')
@@ -468,18 +485,31 @@ class SnapshotStore {
         try {
           rmSync(abs, { force: true })
           deletedFiles++
-        } catch { /* noop */ }
+        } catch (e) {
+          failedDeletions.push({ path: rel, error: e.message })
+        }
       }
     }
+    // If any deletions failed, mark the restore as partially failed
+    if (failedDeletions.length > 0) {
+      console.warn('[turn-undo] restore failed to delete', failedDeletions.length, 'files:', failedDeletions.map(f => f.path).join(', '))
+    }
 
-    return {
-      ok: true,
+    const result = {
+      ok: skippedFiles.length === 0 && failedDeletions.length === 0,
       restoredFiles,
       deletedFiles,
+      skippedFiles,
+      failedDeletions,
       targetTurn,
       restoredTurn: target.turn,
       totalFiles: rels.length,
     }
+    // Log skipped files for debugging
+    if (skippedFiles.length > 0) {
+      console.warn('[turn-undo] restore skipped', skippedFiles.length, 'files:', skippedFiles.map(f => f.path).join(', '))
+    }
+    return result
   }
 
   /**
@@ -707,7 +737,7 @@ class SnapshotRuntime {
     const run = prev.then(async () => {
       // brief delay so writes settle
       await wait(this.delayMs)
-      const result = this.store.capture(cwd, sessionId, turn)
+      const result = await this.store.capture(cwd, sessionId, turn)
       this.store.cleanup()
       return result
     })
@@ -932,7 +962,7 @@ function createHandler(ctx, runtime, sessions, agents) {
         try {
           const chain = runtime.store.loadChain(sessionId)
           const lastTurn = chain.length ? chain[chain.length - 1].turn : 0
-          await runtime.captureNow(cwd, sessionId, lastTurn + 0.5)
+          await runtime.captureNow(cwd, sessionId, lastTurn + 0.999)
         } catch (e) {
           console.warn('[turn-undo] safety snapshot failed (non-fatal):', e?.message)
         }
