@@ -414,6 +414,69 @@ class SnapshotStore {
     return true
   }
 
+  /** Read an object file from the content-addressed store and return its text content. */
+  readObjectContent(hash) {
+    if (!hash) return null
+    const objPath = join(this.objDir, hash)
+    if (!existsSync(objPath)) return null
+    try {
+      return readFileSync(objPath, 'utf-8')
+    } catch {
+      return null
+    }
+  }
+
+  /** Generate a simple line-based diff between two arrays of lines. */
+  generateDiff(oldLines, newLines) {
+    const m = oldLines.length
+    const n = newLines.length
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        if (oldLines[i - 1] === newLines[j - 1]) {
+          dp[i][j] = dp[i - 1][j - 1] + 1
+        } else {
+          dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1])
+        }
+      }
+    }
+
+    const result = []
+    let i = m
+    let j = n
+
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+        result.push({ type: 'same', value: oldLines[i - 1] })
+        i--
+        j--
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        result.push({ type: 'added', value: newLines[j - 1] })
+        j--
+      } else {
+        result.push({ type: 'removed', value: oldLines[i - 1] })
+        i--
+      }
+    }
+
+    result.reverse()
+    return result
+  }
+
+  /** Read manifest entries into a map of path -> content */
+  readManifestContents(manifest) {
+    const contents = {}
+    for (const [rel, entry] of Object.entries(manifest)) {
+      if (entry.kind === 'file' && entry.hash) {
+        const content = this.readObjectContent(entry.hash)
+        if (content !== null) {
+          contents[rel] = content
+        }
+      }
+    }
+    return contents
+  }
+
   /** Load snapshot manifests for a session, oldest first. */
   loadChain(sessionId) {
     const dir = join(this.snapDir, sessionId)
@@ -1097,6 +1160,11 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
   // undo (restoring to baseline) will affect — every change made at or after
   // the target turn.
   const changes = []
+  
+  // Read manifest contents for diff computation
+  const baselineContents = this.readManifestContents(baselineManifest)
+  const latestContents = this.readManifestContents(latestManifest)
+  
   for (const rel of Object.keys(latestManifest)) {
     const entry = latestManifest[rel]
     if (!baselineManifest[rel]) {
@@ -1104,7 +1172,16 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
     } else {
       const prevEntry = baselineManifest[rel]
       if (entry.hash !== prevEntry.hash) {
-        changes.push({ path: rel, kind: 'modified' })
+        const oldContent = baselineContents[rel] || ''
+        const newContent = latestContents[rel] || ''
+        const oldLines = oldContent.split('\n')
+        const newLines = newContent.split('\n')
+        const diff = this.generateDiff(oldLines, newLines)
+        changes.push({ 
+          path: rel, 
+          kind: 'modified',
+          diff: { oldLines: oldLines.length, newLines: newLines.length, hunks: diff }
+        })
       }
     }
   }

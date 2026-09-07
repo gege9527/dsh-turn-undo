@@ -100,6 +100,16 @@ window.__ModuleLoader__.load({
           '.dtu-btn{padding:8px 16px;border:0;border-radius:6px;font-size:14px;cursor:pointer}',
           '.dtu-btn-cancel{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}.dtu-btn-cancel:hover{background:var(--dsw-alias-interactive-bg-hover)}',
           '.dtu-btn-primary{background:var(--dsw-alias-state-business-primary);color:#fff;font-weight:500;min-width:120px}.dtu-btn-primary:hover{opacity:.9}.dtu-btn-primary:disabled{opacity:.5;cursor:not-allowed}',
+          '.dtu-file{cursor:pointer}.dtu-file:hover{background:var(--dsw-alias-bg-layer-3)}',
+          '.dtu-diff{max-height:400px;overflow:auto;font-family:monospace;font-size:12px;line-height:1.5;margin-top:12px;padding:8px;background:var(--dsw-alias-bg-layer-2);border-radius:6px}',
+          '.dtu-diff-line{white-space:pre-wrap;word-break:break-all}',
+          '.dtu-diff-removed{background:rgba(248,81,73,.15);color:#f85149}.dtu-diff-removed::before{content:"- ";opacity:.6}',
+          '.dtu-diff-added{background:rgba(63,185,80,.15);color:#39b54e}.dtu-diff-added::before{content:"+ ";opacity:.6}',
+          '.dtu-diff-same{color:var(--dsw-alias-label-tertiary)}.dtu-diff-same::before{content:"  "}',
+          '.dtu-diff-hunk{color:var(--dsw-alias-label-secondary);font-size:11px;margin-bottom:4px}',
+          '.dtu-diff-close{float:right;background:transparent;border:0;font-size:18px;cursor:pointer;color:var(--dsw-alias-label-secondary)}',
+          '.dtu-diff-close:hover{color:var(--dsw-alias-label-primary)}',
+          '.dtu-diff-file{font-weight:600;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--dsw-alias-border-color)}',
         ].join('')
         document.head.appendChild(styleEl)
       }
@@ -352,6 +362,11 @@ window.__ModuleLoader__.load({
         var noSnapshot = props.noSnapshot
         var canApply = props.canApply
         var applyRestore = props.applyRestore
+        
+        // Diff viewing state
+        var showDiffState = useState(null)
+        var showDiff = showDiffState[1]
+        var viewingDiff = showDiffState[0]
 
         // 文件很多时避免一次性渲染大量 DOM（性能优化）：只渲染前 200 个，
         // 其余折叠成一条提示。总数仍在标题里显示。
@@ -385,11 +400,35 @@ window.__ModuleLoader__.load({
                       h('div', { className: 'dtu-section-label' }, '将影响的文件 (' + changes.length + ' 个)'),
                       h('div', { className: 'dtu-files' },
                         shownChanges.map(function (change, idx) {
-                          return h('div', { key: idx, className: 'dtu-file' },
+                          var isModified = change.kind === 'modified' && change.diff
+                          return h('div', {
+                            key: idx,
+                            className: 'dtu-file',
+                            onClick: isModified ? function () { showDiff(isModified ? change : null) } : undefined,
+                            style: isModified ? { cursor: 'pointer' } : {}
+                          },
                             h('code', {}, change.path),
                             h('span', { className: 'dtu-kind' }, kindLabel(change.kind)),
+                            isModified ? h('span', { className: 'dtu-diff-indicator', style: { fontSize: '10px', marginLeft: '4px', opacity: '.5' } }, '📄') : null
                           )
                         }),
+                        viewingDiff
+                          ? h('div', { className: 'dtu-section' },
+                              h('div', { className: 'dtu-diff-file' }, viewingDiff.path),
+                              h('button', {
+                                className: 'dtu-diff-close',
+                                onClick: function () { showDiff(null) }
+                              }, '✕'),
+                              h('div', { className: 'dtu-diff' },
+                                viewingDiff.diff.hunks.map(function (hunk, hIdx) {
+                                  var className = hunk.type === 'removed' ? 'dtu-diff-removed'
+                                  : hunk.type === 'added' ? 'dtu-diff-added'
+                                  : 'dtu-diff-same'
+                                  return h('div', { key: hIdx, className: 'dtu-diff-line ' + className }, hunk.value)
+                                })
+                              )
+                            )
+                          : null,
                         (changes.length > shownChanges.length)
                           ? h('div', { className: 'dtu-more' },
                               '… 还有 ' + (changes.length - shownChanges.length) + ' 个文件未显示'

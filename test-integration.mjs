@@ -145,6 +145,27 @@ assert(resWithSkipped.skippedFiles && resWithSkipped.skippedFiles.length === 1, 
 assert(resWithSkipped.skippedFiles[0].reason === 'object_missing', 'skipped file reason is object_missing')
 console.log('✓ skipped files test completed:', resWithSkipped.skippedFiles.length, 'files skipped')
 
+// --- Test 3: Verify preview returns diff data for modified files ---
+const diffStore = new SnapshotStore({ baseDir: join(testDir, 'turn-undo-diff') })
+const diffContent = ['line1', 'line2', 'line3'].join('\n')
+writeFileSync(join(wsDir, 'diff-test.txt'), diffContent, 'utf-8')
+await diffStore.capture(wsDir, 'diff-sess', 1)
+const newDiffContent = ['line1', 'modified', 'line3', 'line4'].join('\n')
+writeFileSync(join(wsDir, 'diff-test.txt'), newDiffContent, 'utf-8')
+await diffStore.capture(wsDir, 'diff-sess', 2)
+const diffPreview = diffStore.preview('diff-sess', 2)
+const modifiedChanges = diffPreview.changes.filter(c => c.kind === 'modified')
+assert(modifiedChanges.length >= 1, 'preview includes modified files')
+if (modifiedChanges.length > 0) {
+  const modified = modifiedChanges[0]
+  assert(modified.diff !== undefined, 'modified file has diff property')
+  assert(modified.diff.oldLines > 0, 'diff has oldLines count')
+  assert(modified.diff.newLines > 0, 'diff has newLines count')
+  assert(Array.isArray(modified.diff.hunks), 'diff has hunks array')
+  assert(modified.diff.hunks.length > 0, 'hunks contains entries')
+  console.log('✓ diff data verified: file=' + modified.path + ', hunks=' + modified.diff.hunks.length)
+}
+
 // --- Cleanup ---
 if (existsSync(testDir)) rmSync(testDir, { recursive: true })
 if (oldHome) process.env.DSH_HOME = oldHome
