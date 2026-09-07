@@ -405,8 +405,8 @@ window.__ModuleLoader__.load({
       function DiffOverlay(props) {
         var onClose = props.onClose
         var change = props.change
-        var oldEditorRef = reactDom.createRef()
-        var newEditorRef = reactDom.createRef()
+        var oldEditorRef = react.createRef()
+        var newEditorRef = react.createRef()
         
         var isCreated = change.kind === 'created'
         var isDeleted = change.kind === 'deleted'
@@ -566,7 +566,9 @@ window.__ModuleLoader__.load({
           ),
           document.body
         )
-      }function RestoreDialog(props) {
+      }
+
+      function RestoreDialog(props) {
         var sessionId = props.sessionId
         var messageText = props.messageText
         var onClose = props.onClose
