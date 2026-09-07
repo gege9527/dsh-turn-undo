@@ -70,6 +70,50 @@ window.__ModuleLoader__.load({
       var useEffect = react.useEffect
       var useLayoutEffect = react.useLayoutEffect
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
       var STYLE_ID = 'dsh-turn-undo'
       if (!document.getElementById('dsh-turn-undo-styles')) {
         var styleEl = document.createElement('style')
@@ -107,17 +151,13 @@ window.__ModuleLoader__.load({
           '.dtu-fullscreen-path{font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
           '.dtu-fullscreen-close{background:transparent;border:0;font-size:24px;cursor:pointer;color:var(--dsw-alias-label-tertiary);padding:4px 8px;border-radius:6px}.dtu-fullscreen-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
           '.dtu-fullscreen-body{flex:1;display:flex;flex-direction:column;overflow:hidden}',
-          '.dtu-diff-columns-wrapper{display:flex;padding:0 16px 8px;font-size:11px;font-weight:600;color:var(--dsw-alias-label-tertiary);text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}',
-          '.dtu-diff-column-label{flex:1;text-align:center;border-bottom:1px solid var(--dsw-alias-border-l2);padding-bottom:4px}',
-          '.dtu-diff-scroll-container{flex:1;overflow:auto}',
-          '.dtu-diff-row{display:flex;border-bottom:1px solid var(--dsw-alias-border-l1);min-height:21px}',
-          '.dtu-diff-row-removed{background:rgba(248,81,73,.15)}',
-          '.dtu-diff-row-added{background:rgba(63,185,80,.15)}',
-          '.dtu-diff-cell{flex:1;font-family:monospace;font-size:13px;line-height:21px;padding:0 8px 0 52px;display:flex;white-space:pre-wrap;word-break:break-all;position:relative}',
-          '.dtu-diff-cell-removed{color:#f85149}',
-          '.dtu-diff-cell-added{color:#39b54e}',
-          '.dtu-diff-line-num{position:absolute;left:4px;top:0;width:44px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px;pointer-events:none;padding-right:4px}',
-          '.dtu-diff-line-num-empty{visibility:hidden}',
+          '.dtu-diff-scroll-area{flex:1;overflow:auto}',
+          '.dtu-diff-line{font-family:monospace;font-size:13px;line-height:21px;height:21px;padding:0 48px 0 48px;display:flex;white-space:pre-wrap;word-break:break-all}',
+          '.dtu-diff-gutter{position:absolute;left:0;top:0;width:44px;padding:0 4px;display:flex;align-items:center;justify-content:flex-end;pointer-events:none}',
+          '.dtu-diff-marker{width:14px;text-align:right;font-weight:700;font-size:14px}',
+          '.dtu-diff-num{width:26px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px}',
+          '.dtu-diff-removed{background:rgba(248,81,73,.12);color:#f85149}.dtu-diff-removed .dtu-diff-marker{color:#f85149}',
+          '.dtu-diff-added{background:rgba(63,185,80,.12);color:#39b54e}.dtu-diff-added .dtu-diff-marker{color:#39b54e}',
           '.dtu-diff-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--dsw-alias-label-tertiary);font-size:14px}',
         ].join('')
         document.head.appendChild(styleEl)
@@ -357,153 +397,174 @@ window.__ModuleLoader__.load({
         )
       }
 
-      // Full-screen VSCode-style diff overlay — side-by-side with single scrollbar
-      function DiffOverlay(props) {
-        var onClose = props.onClose
-        var change = props.change
-        
-        var isCreated = change.kind === 'created'
-        var isDeleted = change.kind === 'deleted'
-        var isModified = change.kind === 'modified'
-        
-        // Build diff rows with line pairs for side-by-side view
-        var diffRows = []
-        
-        if (change.diff && change.diff.hunks) {
-          var hunks = change.diff.hunks
-          var oldLine = 0
-          var newLine = 0
-          
-          for (var i = 0; i < hunks.length; i++) {
-            var hunk = hunks[i]
-            var oldContent = null
-            var newContent = null
-            
-            if (hunk.type === 'removed') {
-              oldContent = hunk.value
-              oldLine++
-            } else if (hunk.type === 'added') {
-              newContent = hunk.value
-              newLine++
-            } else {
-              oldContent = hunk.value
-              newContent = hunk.value
-              oldLine++
-              newLine++
-            }
-            
-            diffRows.push({
-              oldContent: oldContent,
-              newContent: newContent,
-              oldLine: oldContent ? oldLine : null,
-              newLine: newContent ? newLine : null,
-              same: hunk.type === 'same'
-            })
-          }
-        }
-        
-        // For modified files, also show which lines are changed vs unchanged
-        if (isModified) {
-          // Rebuild with proper change detection
-          diffRows = []
-          oldLine = 0
-          newLine = 0
-          
-          for (var j = 0; j < change.diff.hunks.length; j++) {
-            var hunk = change.diff.hunks[j]
-            if (hunk.type === 'removed') {
-              diffRows.push({
-                oldContent: hunk.value,
-                newContent: '',
-                oldLine: ++oldLine,
-                newLine: null,
-                changed: true,
-                removed: true
-              })
-            } else if (hunk.type === 'added') {
-              diffRows.push({
-                oldContent: '',
-                newContent: hunk.value,
-                oldLine: null,
-                newLine: ++newLine,
-                changed: true,
-                added: true
-              })
-            } else {
-              diffRows.push({
-                oldContent: hunk.value,
-                newContent: hunk.value,
-                oldLine: ++oldLine,
-                newLine: ++newLine,
-                changed: false
-              })
-            }
-          }
-        }
-        
-        function renderCell(content, lineNum, type) {
-          var cellClass = 'dtu-diff-cell'
-          if (type === 'removed') cellClass += ' dtu-diff-cell-removed'
-          else if (type === 'added') cellClass += ' dtu-diff-cell-added'
-          
-          return h('div', { className: cellClass },
-            lineNum ? h('span', { className: 'dtu-diff-line-num' }, String(lineNum)) : h('span', { className: 'dtu-diff-line-num dtu-diff-line-num-empty' }),
-            content || ''
-          )
-        }
-        
-        var leftLabel = isCreated ? '' : '原始版本'
-        var rightLabel = isDeleted ? '' : '修改后版本'
-        
-        return reactDom.createPortal(
-          h('div', {
-            className: 'dtu-fullscreen-diff',
-            onClick: onClose,
-            onKeyDown: function (e) {
-              if (e.key === 'Escape') onClose()
-            }
-          },
-            h('div', { className: 'dtu-fullscreen-header', onClick: function (e) { e.stopPropagation() } },
-              h('button', {
-                className: 'dtu-fullscreen-back',
-                onClick: onClose
-              }, '← 关闭'),
-              h('span', { className: 'dtu-fullscreen-path' }, change.path),
-              h('div', null,
-                isCreated ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 新文件') : null,
-                isDeleted ? h('span', { style: { color: '#f85149', fontSize: '11px' } }, '● 已删除') : null,
-                isModified ? h('span', { style: { color: '#f85149', fontSize: '11px', marginRight: '8px' } }, '● 删除') : null,
-                isModified ? h('span', { style: { color: '#39b54e', fontSize: '11px' } }, '● 添加') : null
-              ),
-              h('button', {
-                className: 'dtu-fullscreen-close',
-                onClick: onClose
-              }, '✕')
-            ),
-            h('div', { className: 'dtu-fullscreen-body' },
-              h('div', { className: 'dtu-diff-columns-wrapper' },
-                leftLabel ? h('div', { className: 'dtu-diff-column-label' }, leftLabel) : null,
-                rightLabel ? h('div', { className: 'dtu-diff-column-label' }, rightLabel) : null
-              ),
-              h('div', { className: 'dtu-diff-scroll-container' },
-                diffRows.length > 0
-                  ? h('div', null, diffRows.map(function (row, idx) {
-                      var leftCell = renderCell(row.oldContent, row.oldLine, row.removed ? 'removed' : 'same')
-                      var rightCell = renderCell(row.newContent, row.newLine, row.added ? 'added' : 'same')
-                      
-                      var rowClass = 'dtu-diff-row'
-                      if (row.changed && row.removed) rowClass += ' dtu-diff-row-removed'
-                      else if (row.changed && row.added) rowClass += ' dtu-diff-row-added'
-                      
-                      return h('div', { key: idx, className: rowClass }, leftCell, rightCell)
-                    }))
-                  : h('div', { className: 'dtu-diff-empty' }, '(无差异)')
-              )
-            )
-          ),
-          document.body
-        )
-      }
+      // Full-screen diff overlay component
+      // Full-screen single-column diff overlay — shows ONLY changed lines
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
       function RestoreDialog(props) {
         var sessionId = props.sessionId
