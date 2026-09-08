@@ -456,16 +456,20 @@ window.__ModuleLoader__.load({
                       
                       var escapedText = escapeHtml(row.text)
                       
+                      // 根据行类型决定左右栏内容
+                      var leftText = (row.type === 'added') ? '' : escapedText
+                      var rightText = (row.type === 'removed') ? '' : escapedText
+                      
                       return h('div', { key: idx, className: rowClass },
                         // 左栏
                         h('div', { className: 'dtu-diff-cell dtu-diff-cell-left' },
                           h('span', { className: 'dtu-diff-line-num' }, row.oldLine || ''),
-                          escapedText
+                          leftText
                         ),
                         // 右栏
                         h('div', { className: 'dtu-diff-cell dtu-diff-cell-right' },
                           h('span', { className: 'dtu-diff-line-num' }, row.newLine || ''),
-                          escapedText
+                          rightText
                         )
                       )
                     }))
