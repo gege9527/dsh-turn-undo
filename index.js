@@ -427,7 +427,7 @@ class SnapshotStore {
   }
 
   /** Generate a simple line-based diff between two arrays of lines. */
-  generateDiff(oldLines, newLines) {
+  generateDiff(oldLines, newLines, contextLines = 10) {
     const m = oldLines.length
     const n = newLines.length
     const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
@@ -460,6 +460,54 @@ class SnapshotStore {
     }
 
     result.reverse()
+
+    // 如果有上下文行数限制，过滤只保留变化行及其上下文
+    if (contextLines > 0) {
+      // 找出所有变化的行索引
+      const changedIndices = new Set()
+      for (let idx = 0; idx < result.length; idx++) {
+        if (result[idx].type !== 'same') {
+          changedIndices.add(idx)
+        }
+      }
+
+      // 标记需要包含的行
+      const keepIndices = new Set()
+      for (const idx of changedIndices) {
+        // 保留变化行本身
+        keepIndices.add(idx)
+        // 保留前后 contextLines 行
+        for (let k = 1; k <= contextLines; k++) {
+          if (idx - k >= 0) keepIndices.add(idx - k)
+          if (idx + k < result.length) keepIndices.add(idx + k)
+        }
+      }
+
+      // 过滤结果
+      const filtered = []
+      for (let idx = 0; idx < result.length; idx++) {
+        if (keepIndices.has(idx)) {
+          filtered.push(result[idx])
+        } else if (result[idx].type === 'same') {
+          // 省略相同行标记
+          filtered.push({ type: 'same', value: '...' })
+        }
+      }
+
+      // 合并连续的省略标记
+      const merged = []
+      for (const item of filtered) {
+        if (item.type === 'same' && item.value === '...') {
+          if (merged.length > 0 && merged[merged.length - 1].value === '...') {
+            continue // 跳过连续的省略
+          }
+        }
+        merged.push(item)
+      }
+
+      return merged
+    }
+
     return result
   }
 
@@ -1189,7 +1237,7 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
         const newContent = latestContents[rel] || ''
         const oldLines = oldContent.split('\n')
         const newLines = newContent.split('\n')
-        const diff = this.generateDiff(oldLines, newLines)
+        const diff = this.generateDiff(oldLines, newLines, 10)
         changes.push({ 
           path: rel, 
           kind: 'modified',
