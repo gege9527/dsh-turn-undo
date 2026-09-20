@@ -395,7 +395,7 @@ window.__ModuleLoader__.load({
         var previewState = useState(null)
         var preview = previewState[0]
         var setPreview = previewState[1]
-        var loadingState = useState(true)
+        var loadingState = useState(false)
         var loading = loadingState[0]
         var setLoading = loadingState[1]
         var errorState = useState(null)
@@ -408,28 +408,17 @@ window.__ModuleLoader__.load({
         var done = doneState[0]
         var setDone = doneState[1]
 
-        useEffect(function () {
-          var cancelled = false
-          setLoading(true)
-          setError(null)
-          fetch(API_PATH + '?sessionId=' + encodeURIComponent(sessionId) + '&messageSeq=' + messageSeq + '&promptText=' + encodeURIComponent(messageText), {
-            method: 'GET', headers: { 'Accept': 'application/json' }, cache: 'no-store',
-          })
-            .then(function (res) { return res.json() })
-            .then(function (data) { if (!cancelled) setPreview(data) })
-            .catch(function (err) { if (!cancelled) setError(err.message || '请求失败') })
-            .finally(function () { if (!cancelled) setLoading(false) })
-          return function () { cancelled = true }
-        }, [])
+        // NOTE: preview 只在用户点开弹框时请求（见 show()）。挂载时预取毫无
+        // 意义——按钮只渲染图标，不消费 preview——却会让每个会话在打开瞬间
+        // 为每条用户消息各发一次全工作区扫描请求（实测单次 1.2–2.7 秒）。
 
         function show() {
           setOpen(true)
           setPreview(null)
           setDone(false)
           setLoading(true)
-          // NOTE: cancelled 只存在于 mount effect 闭包，show() 引用它会抛
-          // ReferenceError → setLoading(false) 永不执行 → 弹框一直"正在检查…"，
-          // 且未捕获错误可能导致 React 卸下 portal（按钮消失）。必须无条件收尾。
+          // NOTE: 必须无条件收尾：任何未捕获错误都会让 setLoading(false) 不执行，
+          // 弹框会永远停在"正在检查…"，且可能让 React 卸下 portal（按钮消失）。
           fetch(API_PATH + '?sessionId=' + encodeURIComponent(sessionId) + '&messageSeq=' + messageSeq + '&promptText=' + encodeURIComponent(messageText), {
             method: 'GET', headers: { 'Accept': 'application/json' }, cache: 'no-store',
           })
@@ -468,6 +457,7 @@ window.__ModuleLoader__.load({
 
         var changes = (preview && Array.isArray(preview.changes)) ? preview.changes : []
         var noSnapshot = (preview && preview.noSnapshot) === true
+        var noBaseline = (preview && preview.noBaseline) === true
         var previewError = (preview && preview.error) ? preview.error : null
 
         return h('div', { className: 'dtu-container' },
@@ -491,7 +481,8 @@ window.__ModuleLoader__.load({
             sessionId: sessionId, messageText: messageText,
             onClose: close, preview: preview, loading: loading, error: error,
             applying: applying, done: done, changes: changes,
-            previewError: previewError, noSnapshot: noSnapshot, canApply: canApply, applyRestore: applyRestore,
+            previewError: previewError, noSnapshot: noSnapshot, noBaseline: noBaseline,
+            canApply: canApply, applyRestore: applyRestore,
           }) : null,
         )
       }
@@ -629,6 +620,7 @@ window.__ModuleLoader__.load({
         var changes = props.changes
         var previewError = props.previewError
         var noSnapshot = props.noSnapshot
+        var noBaseline = props.noBaseline
         var canApply = props.canApply
         var applyRestore = props.applyRestore
         
@@ -662,9 +654,11 @@ window.__ModuleLoader__.load({
                 previewError ? h('p', { className: 'dtu-error' }, previewError) : null,
                 (!loading && noSnapshot)
                   ? h('p', { className: 'dtu-status' }, '该时点没有可用快照，将仅创建新会话。') : null,
-                (!loading && !previewError && !noSnapshot && changes.length === 0)
+                (!loading && !noSnapshot && noBaseline)
+                  ? h('p', { className: 'dtu-status' }, '这条消息之前没有可用快照，无法恢复文件，将仅创建新会话。') : null,
+                (!loading && !previewError && !noSnapshot && !noBaseline && changes.length === 0)
                   ? h('p', { className: 'dtu-status' }, '这条消息之前没有需要恢复的文件。') : null,
-                (!loading && !previewError && changes.length > 0)
+                (!loading && !previewError && !noSnapshot && !noBaseline && changes.length > 0)
                   ? h('div', { className: 'dtu-section' },
                       h('div', { className: 'dtu-section-label' }, '将影响的文件 (' + changes.length + ' 个)'),
                       h('div', { className: 'dtu-files' },

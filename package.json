@@ -1,6 +1,6 @@
 {
   "name": "dsh-turn-undo",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Undo to any point in a DSH conversation — revert files and fork a new session",
   "type": "module",
   "main": "index.js",

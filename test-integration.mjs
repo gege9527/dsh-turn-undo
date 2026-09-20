@@ -53,14 +53,15 @@ writeFileSync(join(wsDir, 'a.txt'), 'alpha-v2', 'utf-8') // no real change
 let r3 = await store.capture(wsDir, SESS, 3)
 assert(r3 === null || r3.skipped, 'unchanged turn yields null (no new snapshot)')
 
-// --- Preview lists EVERY change at/after the target turn (undo scope) ---
-// 撤销某条消息 = 回退该消息之后的所有改动。因此 preview 的影响范围是从
-// targetTurn 之前的最新快照（baseline）到会话最新快照（latest）之差。
-// 撤销 turn1：baseline={}（turn1 之前无快照）, latest=turn2 => a.txt+b.txt = 2。
+// --- Preview without a baseline reports an explicit state ---
+// 撤销某条消息 = 回退该消息之后的所有改动，影响范围 = baseline（targetTurn 之前
+// 的最新快照）到 latest 之差。但该会话最早的快照就是 turn1 本身，没有 turn1
+// 之前的基线：此时必须报告 noBaseline，而不是把当前所有文件列成 "created"
+// —— 后者会宣称"恢复到空工作区"，而 restore() 随后必以 NO_SNAPSHOT 拒绝。
 const prev = store.preview(SESS, 1)
-assert(prev.totalChanges === 2, 'preview undo-turn1 lists changes at/after turn1 (a.txt,b.txt)')
-assert(prev.changes.some(c => c.path === 'b.txt'), 'preview undo-turn1 includes later turn2 change (b.txt)')
-// 撤销 turn2：baseline=turn1（a.txt v1）, latest=turn2 => a.txt modified + b.txt created = 2。
+assert(prev.noBaseline === true, 'preview without a baseline snapshot reports noBaseline')
+assert(prev.totalChanges === 0, 'noBaseline preview lists no files (no misleading empty-workspace plan)')
+// baseline 存在时（turn2 的 baseline = turn1）：a.txt modified + b.txt created = 2。
 const prev2 = store.preview(SESS, 2)
 assert(prev2.totalChanges === 2, 'preview undo-turn2 lists turn2 changes (2 files)')
 
@@ -164,6 +165,76 @@ if (modifiedChanges.length > 0) {
   assert(Array.isArray(modified.diff.hunks), 'diff has hunks array')
   assert(modified.diff.hunks.length > 0, 'hunks contains entries')
   console.log('✓ diff data verified: file=' + modified.path + ', hunks=' + modified.diff.hunks.length)
+}
+
+// --- Test 4: object sweep reclaims unreferenced objects ---
+// 对象库是内容寻址的，manifest 被 TTL/上限删除后其对象若无人回收就会永久堆积
+// （实测线上达到 983 MB / 4 万文件）。sweepObjects 标记所有存活 manifest 可达的
+// hash，删除未被引用且超过宽限期的对象。
+{
+  const gcStore = new SnapshotStore({
+    baseDir: join(testDir, 'turn-undo-gc'),
+    objectGcGraceMs: 0,
+    objectGcIntervalMs: 0,
+  })
+  const gcWs = join(testDir, 'gc-ws')
+  mkdirSync(gcWs, { recursive: true })
+  writeFileSync(join(gcWs, 'keep.txt'), 'keep-v1', 'utf-8')
+  const gc1 = await gcStore.capture(gcWs, 'gc-sess', 1)
+  writeFileSync(join(gcWs, 'keep.txt'), 'keep-v2', 'utf-8')
+  await gcStore.capture(gcWs, 'gc-sess', 2)
+
+  const keepHash = gc1.manifest.manifest['keep.txt'].hash
+  const objectsBefore = readdirSync(gcStore.objDir).length
+  // 删除最新 manifest，使 keep-v2 的对象变成孤儿
+  rmSync(join(gcStore.snapDir, 'gc-sess', '2.json'))
+
+  const swept = gcStore.sweepObjects({ force: true })
+  assert(swept !== null && swept.removed === 1, 'sweep removes exactly the orphaned object')
+  assert(readdirSync(gcStore.objDir).length === objectsBefore - 1, 'object store shrank by one')
+  assert(existsSync(join(gcStore.objDir, keepHash)), 'object still referenced by a live manifest survives the sweep')
+
+  // 宽限期内的孤儿对象必须保留：capture() 先写对象再写 manifest，
+  // 删除"年轻"的孤儿会破坏正在进行的快照。
+  const graceStore = new SnapshotStore({
+    baseDir: join(testDir, 'turn-undo-gc-grace'),
+    objectGcGraceMs: 60_000,
+    objectGcIntervalMs: 0,
+  })
+  const graceWs = join(testDir, 'gc-grace-ws')
+  mkdirSync(graceWs, { recursive: true })
+  writeFileSync(join(graceWs, 'young.txt'), 'young', 'utf-8')
+  await graceStore.capture(graceWs, 'grace-sess', 1)
+  const youngCount = readdirSync(graceStore.objDir).length
+  const graceSwept = graceStore.sweepObjects({ force: true })
+  assert(graceSwept !== null && graceSwept.removed === 0, 'sweep keeps orphans inside the grace window')
+  assert(readdirSync(graceStore.objDir).length === youngCount, 'grace-window object store is untouched')
+}
+
+// --- Test 5: preview against the LIVE workspace when targetTurn is ahead ---
+// turn 尚未结束（无对应快照）时，latest 必须是当前工作区，否则 preview 会拿
+// 旧快照与 baseline 比较而返回 0 变更。
+{
+  const liveStore = new SnapshotStore({ baseDir: join(testDir, 'turn-undo-live') })
+  const liveWs = join(testDir, 'live-ws')
+  mkdirSync(liveWs, { recursive: true })
+  writeFileSync(join(liveWs, 'f.txt'), 'v1', 'utf-8')
+  await liveStore.capture(liveWs, 'live-sess', 1)
+  // turn 1 之后工作区被改，但没有更新的快照
+  writeFileSync(join(liveWs, 'f.txt'), 'v2-live', 'utf-8')
+
+  const livePrev = liveStore.preview('live-sess', 2, liveWs)
+  assert(livePrev.totalChanges === 1, 'live preview detects the working-tree change')
+  const liveMod = livePrev.changes.find(c => c.path === 'f.txt')
+  assert(liveMod && liveMod.kind === 'modified', 'live change is reported as modified')
+  // live 文件的字节从未写入对象库；若 diff 仍从对象库取新内容，会把 'v1' 之后的
+  // 内容全部当作删除（新增行为空）。
+  const addedLines = (liveMod.diff?.hunks ?? []).filter(h => h.type === 'added').map(h => h.value)
+  assert(addedLines.includes('v2-live'), 'live diff new-content comes from the working tree, not the object store')
+
+  // 目标 turn 在链尾之内时仍走快照对比（不被 live 扫描污染）
+  const snapPrev = liveStore.preview('live-sess', 1, liveWs)
+  assert(snapPrev.noBaseline === true, 'target ahead of chain still uses snapshots when in range')
 }
 
 // --- Cleanup ---

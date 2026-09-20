@@ -51,6 +51,12 @@ const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024 // 10 MB
 const DEFAULT_MAX_FILES_PER_SNAPSHOT = 10000
 const DEFAULT_MAX_SNAPSHOT_BYTES = 500 * 1024 * 1024 // 500 MB
 const DEFAULT_SNAPSHOT_DELAY_MS = 250
+// Object-store GC: unreferenced objects are only reclaimed once they are older
+// than the grace window (a capture writes objects before its manifest, so a
+// young unreferenced object may still be in flight). The sweep itself is
+// throttled because it stats every object and parses every surviving manifest.
+const DEFAULT_OBJECT_GC_GRACE_MS = 60 * 60 * 1000
+const DEFAULT_OBJECT_GC_INTERVAL_MS = 6 * 60 * 60 * 1000
 const DEFAULT_EXCLUDES = [
   'node_modules/',
   '.git/',
@@ -187,6 +193,9 @@ class SnapshotStore {
     this.maxBytes = cfg.maxSnapshotBytes ?? DEFAULT_MAX_SNAPSHOT_BYTES
     this.ttlDays = cfg.snapshotTtlDays ?? DEFAULT_SNAPSHOT_TTL_DAYS
     this.maxSnapshots = cfg.maxSnapshotsPerSession ?? DEFAULT_MAX_SNAPSHOTS_PER_SESSION
+    this.objectGcGraceMs = cfg.objectGcGraceMs ?? DEFAULT_OBJECT_GC_GRACE_MS
+    this.objectGcIntervalMs = cfg.objectGcIntervalMs ?? DEFAULT_OBJECT_GC_INTERVAL_MS
+    this.lastObjectSweep = 0
     this.objDir = join(this.base, 'objects')
     this.snapDir = join(this.base, 'snapshots')
   }
@@ -511,20 +520,6 @@ class SnapshotStore {
     return result
   }
 
-  /** Read manifest entries into a map of path -> content */
-  readManifestContents(manifest) {
-    const contents = {}
-    for (const [rel, entry] of Object.entries(manifest)) {
-      if (entry.kind === 'file' && entry.hash) {
-        const content = this.readObjectContent(entry.hash)
-        if (content !== null) {
-          contents[rel] = content
-        }
-      }
-    }
-    return contents
-  }
-
   /** Load snapshot manifests for a session, oldest first. */
   loadChain(sessionId) {
     const dir = join(this.snapDir, sessionId)
@@ -649,6 +644,86 @@ class SnapshotStore {
         try { unlinkSync(join(dir, remaining[i])) } catch {}
       }
     }
+    // Manifests are pruned above; reclaim the objects they no longer reference.
+    // Without this the content-addressed store grows forever (an observed store
+    // reached 983 MB / 40k files whose manifests had long been deleted).
+    try { this.sweepObjects() } catch (e) {
+      console.warn('[turn-undo] object sweep failed:', e.message)
+    }
+  }
+
+  /**
+   * Mark-and-sweep the content-addressed object store.
+   *
+   * Every hash reachable from a surviving manifest is marked; unreferenced
+   * objects older than the grace window are deleted. Objects younger than the
+   * grace window are kept because capture() writes objects before it writes
+   * the manifest that references them — deleting those would corrupt an
+   * in-flight snapshot.
+   *
+   * Throttled to `objectGcIntervalMs` since the mark phase parses every
+   * surviving manifest.
+   * @param opts - `force` bypasses the throttle (tests / explicit invocation);
+   *   `dryRun` counts what would be reclaimed without deleting anything.
+   * @returns Counts, or null when the throttle skipped this call.
+   */
+  sweepObjects(opts = {}) {
+    const now = Date.now()
+    if (!opts.force && now - this.lastObjectSweep < this.objectGcIntervalMs) return null
+    this.lastObjectSweep = now
+
+    // ── Mark ──────────────────────────────────────────────────────────
+    const referenced = new Set()
+    let unreadable = 0
+    if (existsSync(this.snapDir)) {
+      for (const sessionId of readdirSync(this.snapDir)) {
+        const dir = join(this.snapDir, sessionId)
+        let dirStat
+        try { dirStat = statSync(dir) } catch { continue }
+        if (!dirStat.isDirectory()) continue
+        for (const f of readdirSync(dir)) {
+          if (!f.endsWith('.json')) continue
+          const data = readJsonFile(join(dir, f))
+          if (!data || !data.manifest) { unreadable++; continue }
+          for (const entry of Object.values(data.manifest)) {
+            if (entry && typeof entry.hash === 'string') referenced.add(entry.hash)
+          }
+        }
+      }
+    }
+
+    // Fail-safe: an unparseable manifest would contribute no marks, so its
+    // objects would look unreferenced and be deleted — silently destroying a
+    // snapshot that is merely unreadable. Abort rather than sweep on a
+    // possibly-incomplete mark set.
+    if (unreadable > 0) {
+      console.warn(`[turn-undo] object sweep skipped: ${unreadable} manifest(s) unreadable`)
+      return { removed: 0, freedBytes: 0, keptYoung: 0, referenced: referenced.size, aborted: 'unreadable-manifest' }
+    }
+
+    // ── Sweep ─────────────────────────────────────────────────────────
+    let removed = 0
+    let freedBytes = 0
+    let keptYoung = 0
+    if (!existsSync(this.objDir)) return { removed, freedBytes, keptYoung, referenced: referenced.size }
+    for (const name of readdirSync(this.objDir)) {
+      if (referenced.has(name)) continue
+      const abs = join(this.objDir, name)
+      let st
+      try { st = statSync(abs) } catch { continue }
+      if (!st.isFile()) continue
+      if (now - st.mtimeMs < this.objectGcGraceMs) { keptYoung++; continue }
+      if (opts.dryRun) { removed++; freedBytes += st.size; continue }
+      try {
+        unlinkSync(abs)
+        removed++
+        freedBytes += st.size
+      } catch {}
+    }
+    if (removed > 0) {
+      console.info(`[turn-undo] object sweep reclaimed ${removed} objects (${Math.round(freedBytes / 1048576)} MB), kept ${keptYoung} young, ${referenced.size} referenced`)
+    }
+    return { removed, freedBytes, keptYoung, referenced: referenced.size }
   }
 }
 
@@ -702,14 +777,20 @@ function resolveForkBoundary(source, messageSeq, promptText) {
   }
 
   // ── Strategy 2: text-based fallback ────────────────────────────────
+  // Only reached for event streams that carry no usable `seq` (persisted
+  // sessions). When the stream DOES carry seqs but none is this user message,
+  // the requested point genuinely does not exist — guessing a different
+  // message here would silently restore the workspace to the wrong turn.
+  const seqsAvailable = events.some(e => typeof e.seq === 'number')
+  if (seqsAvailable && typeof messageSeq === 'number') {
+    return { boundary: null, turn: null, cwd, reason: 'no-matching-message' }
+  }
+
   // Use promptText to match the user message, avoiding the bug of
   // treating messageSeq as an array index when seq is unavailable.
-  //
-  // If promptText is not provided, find the latest user message as a
-  // safe fallback.
   if (promptText) {
     const normalizedPromptText = promptText.trim().substring(0, 200).toLowerCase()
-    message = events.find(e => (
+    const candidates = events.filter(e => (
       e.type === 'user/message'
       && e.data?.source && typeof e.data.source === 'object'
       && e.data.source.kind === 'user'
@@ -721,20 +802,13 @@ function resolveForkBoundary(source, messageSeq, promptText) {
         return text.includes(normalizedPromptText) || normalizedPromptText.includes(text)
       })
     ))
-  }
-
-  // If promptText matching failed or not provided, find the latest user message.
-  if (!message) {
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i]
-      if (e.type === 'turn/start') break
-      if (e.type === 'user/message'
-          && e.data?.source && typeof e.data.source === 'object'
-          && e.data.source.kind === 'user') {
-        message = e
-        break
-      }
+    // Ambiguous text must not be resolved by position: the first match is
+    // routinely an earlier prompt that merely contains the same words
+    // ("继续" and the like).
+    if (candidates.length > 1) {
+      return { boundary: null, turn: null, cwd, reason: 'ambiguous-message' }
     }
+    if (candidates.length === 1) message = candidates[0]
   }
 
   if (!message) return { boundary: null, turn: null, cwd, reason: 'no-user-message' }
@@ -1017,23 +1091,39 @@ function createHandler(ctx, runtime, sessions, agents) {
 
         if (!sessionId) return json(response, 400, { error: 'Missing sessionId' })
 
+        // 单次 readSession 即可：live 会话的 snapshotEvents() 会重放事件，
+        // 每个请求读两遍是纯浪费。
+        const source = await readSession(ctx, sessionId)
+        if (!source) return json(response, 404, { error: 'Session not found' })
+
         let targetTurn = null
+        let unresolved = null
         if (messageSeqParam) {
-          const source = await readSession(ctx, sessionId)
-          if (source) {
-            const b = resolveForkBoundary(source, parseInt(messageSeqParam, 10), promptTextParam)
-            // For preview, pass the turn that the user wants to undo (b.turn).
-            // The preview function will compare this turn's snapshot with the previous one.
-            targetTurn = b.turn !== null && b.turn > 0 ? b.turn : null
-          }
+          const b = resolveForkBoundary(source, parseInt(messageSeqParam, 10), promptTextParam)
+          // For preview, pass the turn that the user wants to undo (b.turn).
+          if (b.turn !== null && b.turn > 0) targetTurn = b.turn
+          else unresolved = b.reason ?? 'no-turn'
         }
 
         // Wait for any in-flight snapshot capture so the preview reflects the
         // latest committed workspace state (avoids showing a stale turn/end).
         try { await runtime.waitForSnapshots() } catch {}
-        const source = await readSession(ctx, sessionId)
-        const cwd = source ? getCwd(source) : undefined
-        const preview = runtime.store.preview(sessionId, targetTurn, cwd)
+
+        // 定位不到消息时返回明确失败，而不是 targetTurn=null 的"0 变更"
+        // —— 后者会让弹框显示"无变化"，掩盖真实的解析失败。
+        if (unresolved !== null) {
+          return json(response, 200, {
+            ok: false,
+            status: 'unresolved',
+            reason: unresolved,
+            error: '定位不到这条消息对应的对话位置，无法撤销',
+            targetTurn: null,
+            totalChanges: 0,
+            changes: [],
+          })
+        }
+
+        const preview = runtime.store.preview(sessionId, targetTurn, getCwd(source))
         return json(response, 200, preview)
       }
 
@@ -1053,15 +1143,25 @@ function createHandler(ctx, runtime, sessions, agents) {
         const source = await readSession(ctx, sessionId)
         if (!source) return json(response, 400, { error: 'Session not found' })
         const cwd = getCwd(source)
-        const b = messageSeq !== null ? resolveForkBoundary(source, messageSeq, promptText) : { boundary: null, turn: null, cwd }
+        const b = messageSeq !== null
+          ? resolveForkBoundary(source, messageSeq, promptText)
+          : { boundary: null, turn: null, cwd, reason: 'no-message-seq' }
 
         // Determine restore target: "recover to before this message" means
         // the state at turn/start, i.e. turn T - 0.5. That snapshot captures
         // the workspace before the user sent this message and before any AI work.
-        let restoreTurn = null
-        if (b.turn !== null && b.turn > 0) {
-          restoreTurn = b.turn - 0.5
+        //
+        // 解析不到目标消息时必须中止：继续执行会 fork 出新会话却跳过文件恢复，
+        // 却仍返回 ok:true —— 用户会以为撤销成功。
+        if (b.turn === null || b.turn <= 0) {
+          return json(response, 200, {
+            ok: false,
+            status: 'unresolved',
+            reason: b.reason ?? 'no-turn',
+            error: '定位不到这条消息对应的对话位置，未做任何修改',
+          })
         }
+        const restoreTurn = b.turn - 0.5
 
         // 3. Wait for any pending snapshot to settle so the manifest is on disk.
         //    Without this, a restore issued right after turn/end may read an
@@ -1081,12 +1181,7 @@ function createHandler(ctx, runtime, sessions, agents) {
         }
 
         // 4. Restore files to the best snapshot at/before restoreTurn.
-        let restoreResult
-        if (restoreTurn !== null) {
-          restoreResult = runtime.store.restore(cwd, sessionId, restoreTurn)
-        } else {
-          restoreResult = { ok: false, error: 'NO_SNAPSHOT' }
-        }
+        const restoreResult = runtime.store.restore(cwd, sessionId, restoreTurn)
 
         // 5. Fork 新会话（DSH 原生，web 的在此分叉按钮同款：ctx.agents.create），
         //    并把旧会话标题加上 （已撤销） 前缀后保留。
@@ -1141,6 +1236,8 @@ export function apply(ctx, config = {}) {
     maxSnapshotBytes: config.maxSnapshotBytes,
     snapshotTtlDays: config.snapshotTtlDays,
     maxSnapshotsPerSession: config.maxSnapshotsPerSession,
+    objectGcGraceMs: config.objectGcGraceMs,
+    objectGcIntervalMs: config.objectGcIntervalMs,
   })
   const runtime = new SnapshotRuntime({
     store,
@@ -1178,55 +1275,74 @@ export function apply(ctx, config = {}) {
 
 /**
  * Build a manifest from the current workspace state without persisting it.
- * Used by preview when the target turn is beyond the latest snapshot.
+ *
+ * Entries whose size+mtime+mode already match `referenceManifest` reuse the
+ * recorded hash instead of re-reading the bytes — the same short-circuit
+ * capture() uses. Without it every preview re-hashes the whole workspace.
+ * @param cwd - workspace root being scanned.
+ * @param referenceManifest - a prior manifest (usually the latest snapshot).
  */
-SnapshotStore.prototype.buildLiveManifest = function (cwd) {
+SnapshotStore.prototype.buildLiveManifest = function (cwd, referenceManifest) {
   const ignore = makeIgnore(cwd, this.excludes)
   const files = this.scan(cwd, ignore)
   if (!files) return null
   const manifest = {}
-  for (const p of files) {
-    const abs = p
+  for (const abs of files) {
     let st
     try { st = lstatSync(abs) } catch { continue }
     if (!st.isFile()) continue
     const rel = relative(cwd, abs).split('\\').join('/')
-    manifest[rel] = {
-      kind: 'file',
-      hash: hashFile(abs),
-      size: st.size,
-      mtime: st.mtimeMs,
-      mode: st.mode.toString(8).padStart(4, '0'),
+    const mode = st.mode.toString(8).padStart(4, '0')
+    const prev = referenceManifest && referenceManifest[rel]
+    if (prev && prev.kind === 'file' && prev.hash
+        && prev.size === st.size && prev.mtime === st.mtimeMs && prev.mode === mode) {
+      manifest[rel] = prev
+    } else {
+      manifest[rel] = {
+        kind: 'file',
+        hash: hashFile(abs),
+        size: st.size,
+        mtime: st.mtimeMs,
+        mode,
+      }
     }
   }
   return manifest
 }
 
+/** Read a workspace file's text; '' when unreadable (binary, deleted, permission). */
+SnapshotStore.prototype.readWorkspaceContent = function (cwd, rel) {
+  try { return readFileSync(resolve(cwd, rel), 'utf-8') } catch { return '' }
+}
+
 // Add preview helper to SnapshotStore prototype.
-// Returns the files that changed during the target turn (turn/end vs turn/start).
+// Returns the files that undo (restoring to the target's baseline) will affect.
 SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
-  const chain = this.loadChain(sessionId)
   if (targetTurn === null) {
     return { ok: true, status: 'ready', targetTurn: null, totalChanges: 0, changes: [] }
+  }
+  const chain = this.loadChain(sessionId)
+  if (chain.length === 0) {
+    return { ok: true, status: 'no-snapshot', targetTurn, totalChanges: 0, changes: [], noSnapshot: true }
   }
 
   // 撤销"发送这条消息之前"会一并回退该消息之后的所有改动，因此影响范围 =
   // baseline（targetTurn 之前最近的快照，即恢复到什么状态）与 latest
   // （会话最新快照，即撤销点之后累积到当前的状态终点）之差。
-  // baseline 取小于 targetTurn 的最新快照：正常是该 turn/start 快照
-  // (T - 0.5)，若中间某 turn 无文件变化没写 manifest，则回退到更早的最近
-  // 快照；对于没有前置快照的首条消息，用空对象 {} 作为基线（即回到空状态）。
   let baseline = null
   for (const m of chain) {
     if (m.turn < targetTurn && (baseline === null || m.turn > baseline.turn)) {
       baseline = m
     }
   }
-  const baselineManifest = baseline ? baseline.manifest : {}
 
-  if (chain.length === 0) {
-    return { ok: true, status: 'ready', targetTurn, totalChanges: 0, changes: [], noSnapshot: true }
+  // 目标消息早于最早可用快照：既无法描述也无法执行恢复。把当前所有文件
+  // 都列成 "created" 会宣称"恢复到空工作区"，而 restore() 随后必以
+  // NO_SNAPSHOT 拒绝 —— 必须明确报告无基线，而不是给出误导性的文件清单。
+  if (baseline === null) {
+    return { ok: true, status: 'no-baseline', targetTurn, totalChanges: 0, changes: [], noBaseline: true }
   }
+  const baselineManifest = baseline.manifest
 
   // 会话最新快照 = 撤销点之后所有改动的累积终点。
   const latest = chain[chain.length - 1]
@@ -1235,55 +1351,54 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
   // yet or snapshots were skipped), compare baseline against the CURRENT
   // workspace state instead of the stale latest snapshot. This ensures the
   // preview shows meaningful changes even when the active turn has no snapshot.
-  let latestManifest
+  let latestManifest = latest.manifest
+  let latestIsLive = false
   if (targetTurn > latest.turn && cwd) {
-    const live = this.buildLiveManifest(cwd)
-    latestManifest = live || latest.manifest
-  } else {
-    latestManifest = latest.manifest
+    const live = this.buildLiveManifest(cwd, latest.manifest)
+    if (live) {
+      latestManifest = live
+      latestIsLive = true
+    }
   }
 
-  // Calculate changes between latest and baseline: these are the files that
-  // undo (restoring to baseline) will affect — every change made at or after
-  // the target turn.
-  const changes = []
-  
-  // Read manifest contents for diff computation
-  const baselineContents = this.readManifestContents(baselineManifest)
-  const latestContents = this.readManifestContents(latestManifest)
-  
+  // ── Collect changed paths FIRST ───────────────────────────────────────
+  // Contents are read only for files whose hash differs; reading every object
+  // in both manifests made one preview cost hundreds of file reads.
   const deleted = []
   const created = []
-
-  // Collect deleted files
+  const modified = []
   for (const rel of Object.keys(baselineManifest)) {
-    if (!latestManifest[rel]) {
-      changes.push({ path: rel, kind: 'deleted' })
-      deleted.push({ path: rel, hash: baselineManifest[rel].hash })
-    }
+    if (!latestManifest[rel]) deleted.push({ path: rel, hash: baselineManifest[rel].hash })
   }
-
-  // Collect created and modified files
   for (const rel of Object.keys(latestManifest)) {
     const entry = latestManifest[rel]
-    if (!baselineManifest[rel]) {
-      changes.push({ path: rel, kind: 'created' })
-      created.push({ path: rel, hash: entry.hash })
-    } else {
-      const prevEntry = baselineManifest[rel]
-      if (entry.hash !== prevEntry.hash) {
-        const oldContent = baselineContents[rel] || ''
-        const newContent = latestContents[rel] || ''
-        const oldLines = oldContent.split('\n')
-        const newLines = newContent.split('\n')
-        const diff = this.generateDiff(oldLines, newLines, 10)
-        changes.push({ 
-          path: rel, 
-          kind: 'modified',
-          diff: { oldLines: oldLines.length, newLines: newLines.length, hunks: diff }
-        })
-      }
-    }
+    const prev = baselineManifest[rel]
+    if (!prev) created.push({ path: rel, hash: entry.hash })
+    else if (entry.hash !== prev.hash) modified.push({ path: rel, oldHash: prev.hash, newHash: entry.hash })
+  }
+
+  const changes = []
+  for (const d of deleted) changes.push({ path: d.path, kind: 'deleted' })
+  for (const c of created) changes.push({ path: c.path, kind: 'created' })
+  for (const m of modified) {
+    const oldContent = this.readObjectContent(m.oldHash) || ''
+    // A live entry's bytes were never written to the object store; read the
+    // working tree instead, or the diff would show every old line as removed.
+    const newContent = latestIsLive
+      ? this.readWorkspaceContent(cwd, m.path)
+      : (this.readObjectContent(m.newHash) || '')
+    const oldLines = oldContent.split('\n')
+    const newLines = newContent.split('\n')
+    // generateDiff is O(n*m) DP; skip hunks for pathologically large files
+    // rather than allocating a multi-hundred-MB table on a preview click.
+    const tooLarge = oldLines.length * newLines.length > 4_000_000
+    changes.push({
+      path: m.path,
+      kind: 'modified',
+      diff: tooLarge
+        ? { oldLines: oldLines.length, newLines: newLines.length, hunks: [], truncated: true }
+        : { oldLines: oldLines.length, newLines: newLines.length, hunks: this.generateDiff(oldLines, newLines, 10) },
+    })
   }
 
   // Detect rename/move: same content hash, different path
