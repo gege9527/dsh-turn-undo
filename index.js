@@ -1031,7 +1031,9 @@ function createHandler(ctx, runtime, sessions, agents) {
         // Wait for any in-flight snapshot capture so the preview reflects the
         // latest committed workspace state (avoids showing a stale turn/end).
         try { await runtime.waitForSnapshots() } catch {}
-        const preview = runtime.store.preview(sessionId, targetTurn)
+        const source = await readSession(ctx, sessionId)
+        const cwd = source ? getCwd(source) : undefined
+        const preview = runtime.store.preview(sessionId, targetTurn, cwd)
         return json(response, 200, preview)
       }
 
@@ -1174,9 +1176,35 @@ export function apply(ctx, config = {}) {
   })
 }
 
+/**
+ * Build a manifest from the current workspace state without persisting it.
+ * Used by preview when the target turn is beyond the latest snapshot.
+ */
+SnapshotStore.prototype.buildLiveManifest = function (cwd) {
+  const ignore = makeIgnore(cwd, this.excludes)
+  const files = this.scan(cwd, ignore)
+  if (!files) return null
+  const manifest = {}
+  for (const p of files) {
+    const abs = p
+    let st
+    try { st = lstatSync(abs) } catch { continue }
+    if (!st.isFile()) continue
+    const rel = relative(cwd, abs).split('\\').join('/')
+    manifest[rel] = {
+      kind: 'file',
+      hash: hashFile(abs),
+      size: st.size,
+      mtime: st.mtimeMs,
+      mode: st.mode.toString(8).padStart(4, '0'),
+    }
+  }
+  return manifest
+}
+
 // Add preview helper to SnapshotStore prototype.
 // Returns the files that changed during the target turn (turn/end vs turn/start).
-SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
+SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
   const chain = this.loadChain(sessionId)
   if (targetTurn === null) {
     return { ok: true, status: 'ready', targetTurn: null, totalChanges: 0, changes: [] }
@@ -1202,7 +1230,18 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn) {
 
   // 会话最新快照 = 撤销点之后所有改动的累积终点。
   const latest = chain[chain.length - 1]
-  const latestManifest = latest.manifest
+
+  // If targetTurn is beyond the latest snapshot (e.g., the turn hasn't ended
+  // yet or snapshots were skipped), compare baseline against the CURRENT
+  // workspace state instead of the stale latest snapshot. This ensures the
+  // preview shows meaningful changes even when the active turn has no snapshot.
+  let latestManifest
+  if (targetTurn > latest.turn && cwd) {
+    const live = this.buildLiveManifest(cwd)
+    latestManifest = live || latest.manifest
+  } else {
+    latestManifest = latest.manifest
+  }
 
   // Calculate changes between latest and baseline: these are the files that
   // undo (restoring to baseline) will affect — every change made at or after
