@@ -9,9 +9,26 @@
 //      messages carry these flow kinds (AI replies use "assistant-step",
 //      "tool-call", etc. and are never selected).
 //   2. Inside the row, find the message actions container (the element
-//      holding the copy/branch buttons). We locate it by taking the parent of
-//      the row's first <button> (dimension-independent of hashed CSS classes).
+//      holding the copy/branch buttons). DSH seats the row's renderer inside
+//      passthrough wrappers (slot outlets render display:contents with one
+//      child), so we walk down firstElementChild past single-child wrappers
+//      to the UserStyleBubble root, whose LAST direct element child is the
+//      MessageIconActions row (dimension-independent of hashed CSS classes).
+//      "Parent of the first button" broke after the ui-attachment refactor:
+//      attachment thumbnails are <button>s that render before the actions
+//      row, so the first button is no longer the copy control.
 //   3. That parent element becomes the portal target for the undo button.
+//
+// DSH 0.1.6+ CSS-reveals a user/steering row's .actions strip only on
+// hover/focus while a later user/steering row exists
+// (MessageIconActions.module.css:
+//  :is([data-chat-flow-kind='user'],[data-chat-flow-kind='steering']):has(
+//    ~ :is(...)) .actions { opacity:0 }). A portal button inside .actions
+//  would inherit that invisibility, so collectPortalTargets tags the
+//  injected container with `data-dtu-always` and the plugin stylesheet
+//  forces `[data-dtu-always]{opacity:1!important}`, keeping the undo
+//  control permanently visible without changing DSH's hover behavior for
+//  the native copy/branch controls elsewhere in the row.
 //
 // Communication:
 //   GET  /api/turn-undo?sessionId=...&turn=...   -> preview
@@ -28,18 +45,68 @@ window.__ModuleLoader__.load({
     var API_PATH = '/api/turn-undo'
     var USER_ROW_SELECTOR = '[data-chat-flow-kind="user"][data-chat-anchor-key], [data-chat-flow-kind="steering"][data-chat-anchor-key]'
 
-    // 定位用户/steering 消息的操作行容器。
-    // 运行时用户行内没有 data-actions-reveal（该属性只在 turn-tail 上）；
-    // 直接用稳定结构：取行内第一个 <button>（copy 等）的 parentElement 作为操作行。
+    // Locate the user/steering message's IconActions row container.
+    //
+    // Structure (ChatNodeSeat.tsx + MessageItem.tsx UserStyleBubble, DSH 0.1.6+):
+    //   div[data-chat-flow-kind="user"]        (row, .flowItem)
+    //     div[data-slot="conversation.chat.node"]  (SlotOutlet anchor,
+    //                                              display:contents passthrough)
+    //       div.userRow                         (UserStyleBubble root)
+    //         div.userStack                     // bubble + attachment rows
+    //         div.actions                       // MessageIconActions row,
+    //                                             LAST child of userRow
+    //
+    // The number of passthrough wrappers between the row and userRow is NOT
+    // stable across DSH versions (renderSlot outlets, providers, ...), so we
+    // cannot hardcode `row.firstElementChild.lastElementChild`. Instead walk
+    // down firstElementChild while the element is a single-child passthrough
+    // (SlotOutlet anchors render display:contents with exactly one child);
+    // the first element with 2+ children is userRow — UserStyleBubble always
+    // renders [userStack, actions], and actions is always its LAST child.
+    //
+    // The container must NOT be located by "parent of the first <button>":
+    // since the ui-attachment refactor, image thumbnails / file-card retry
+    // controls are <button>s that render INSIDE userStack (attachmentRow),
+    // before the actions row. The first button in document order is then an
+    // attachment control, whose parent is the attachment row — landing the
+    // undo button next to the image.
+    //
+    // DSH 0.1.6+ additionally CSS-gates the whole .actions strip to
+    // opacity:0 on any user/steering row that has a later user/steering
+    // sibling (MessageIconActions.module.css `:has(~ …) .actions{opacity:0}`),
+    // revealing it only on row hover/focus. A portal child inside .actions
+    // would be invisible at rest, so collectPortalTargets tags the resolved
+    // container with `data-dtu-always` and the plugin stylesheet forces
+    // `[data-dtu-always]{opacity:1!important}` — the undo control stays
+    // permanently visible on every user row.
     function findIconActions(row) {
       if (!row || row.nodeType !== 1) return null
       var kind = row.getAttribute('data-chat-flow-kind')
       if (kind !== 'user' && kind !== 'steering') return null
-      var firstButton = row.querySelector('button')
-      if (!firstButton) return null
-      var actions = firstButton.parentElement
+      // Walk down through passthrough wrappers (slot outlets etc.): each
+      // renders exactly one child. Stop at the first element with more than
+      // one child — that is userRow ([userStack, actions]). The depth cap is
+      // a runaway guard, not an expected bound.
+      var el = row.firstElementChild
+      var depth = 0
+      while (el && el.children.length <= 1 && depth < 8) {
+        el = el.firstElementChild
+        depth++
+      }
+      if (!el || el.children.length < 2) return null
+      var actions = el.lastElementChild
       if (!actions || actions.nodeType !== 1) return null
+      if (!actions || actions.nodeType !== 1) return null
+      // Guard: the actions row always carries at least one direct <button>
+      // (the copy control). If it does not, the row has no action strip and
+      // there is nowhere to seat the undo button.
       if (actions.querySelectorAll(':scope > button').length < 1) return null
+      // The guard is content-level: an attachment gallery or retry control
+      // that leaked into this container means the DOM structure drifted, and
+      // seating the undo button there would repeat the "next to the image"
+      // bug. Reject rather than inject into the wrong element.
+      if (actions.querySelector('[data-variant]')) return null
+      if (actions.querySelector('img')) return null
       return actions
     }
 
@@ -120,6 +187,12 @@ window.__ModuleLoader__.load({
           '.dtu-diff-line-num{position:absolute;left:4px;top:0;width:44px;text-align:right;color:var(--dsw-alias-label-tertiary);font-size:12px;pointer-events:none;padding-right:4px}',
           '.dtu-diff-line-num-empty{visibility:hidden}',
           '.dtu-diff-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--dsw-alias-label-tertiary);font-size:14px}',
+          // 插件把 portal 按钮注入 .actions 行；DSH 0.1.6+ 对"后面还有 user 行"的
+          // user/steering 行默认 .actions{opacity:0}（仅 hover/focus 显现），
+          // 注入按钮会跟着消失。给注入的容器打 data-dtu-always，用 !important
+          // 强制常显，且不影响 DSH 原生 copy/branch 的 hover 行为（它们仍在
+          // .actions 里，随父盒透明度一起显隐，与撤销按钮一致的常显）。
+          '[data-dtu-always]{opacity:1!important}',
         ].join('')
         document.head.appendChild(styleEl)
       }
@@ -195,16 +268,24 @@ window.__ModuleLoader__.load({
         var sessionId = props.sessionId
         var openRestoredSessionProp = props.openRestoredSession
         var useChat = props.useChat
+
+        // 卡死根因 1：裸用 `useChat(s => s.nodes.values())`。
+        // NodesView.values() 在 upsert 后构建**新数组**（流式输出期间几乎每帧都 dirty），
+        // 而 useSyncExternalStoreWithSelector 的默认比较是 Object.is(选择器返回值)
+        // → 组件每帧重渲染 → useLayoutEffect([nodes]) 每帧 teardown/recreate
+        // body-subtree 的 MutationObserver + 全页扫描 → GUI 卡死。
+        // 修复：用 eq 按内容比较，内容不变时选择器返回旧数组引用，渲染与 effect 都稳定。
         var nodes = useChat(function (snapshot) {
           return snapshot.nodes ? snapshot.nodes.values() : []
-        })
+        }, sameNodeList)
+
         var targetsState = useState([])
         var targets = targetsState[0]
         var setTargets = targetsState[1]
 
         useLayoutEffect(function () {
           var active = true
-          var queued = false
+          var timer = 0
           var refresh = function () {
             if (!active) return
             var next = collectPortalTargets(nodes)
@@ -212,19 +293,55 @@ window.__ModuleLoader__.load({
               return samePortalTargets(current, next) ? current : next
             })
           }
-          var queueRefresh = function () {
-            if (queued || !active) return
-            queued = true
-            queueMicrotask(function () {
-              queued = false
-              refresh()
-            })
+          // 卡死根因 2：observer 回调对**任何** body 变更都跑全页扫描
+          // （流式 token、输入框、hover 状态都在内）。只有关心 user/steering 行
+          // 内部的变更才值得重扫；其余记录直接丢弃。
+          // 再叠加 80ms 时间防抖，把"每帧重扫"压成"静默期结束后扫一次"。
+          var isRelevant = function (record) {
+            var target = record.target
+            var relevant = false
+            var node = target
+            while (node && node.nodeType === 1) {
+              if (node.hasAttribute && node.hasAttribute('data-chat-anchor-key')) {
+                relevant = node.getAttribute('data-chat-flow-kind') === 'user'
+                  || node.getAttribute('data-chat-flow-kind') === 'steering'
+                if (relevant) break
+              }
+              node = node.parentNode
+            }
+            if (!relevant && record.addedNodes) {
+              for (var i = 0; i < record.addedNodes.length; i++) {
+                var added = record.addedNodes[i]
+                var probe = added
+                while (probe && probe.nodeType === 1) {
+                  if (probe.hasAttribute && probe.hasAttribute('data-chat-anchor-key')) {
+                    relevant = probe.getAttribute('data-chat-flow-kind') === 'user'
+                      || probe.getAttribute('data-chat-flow-kind') === 'steering'
+                    break
+                  }
+                  probe = probe.parentNode
+                }
+                if (relevant) break
+              }
+            }
+            return relevant
+          }
+          var queueRefresh = function (records) {
+            if (!active) return
+            for (var i = 0; i < records.length; i++) {
+              if (isRelevant(records[i])) {
+                if (timer) clearTimeout(timer)
+                timer = setTimeout(refresh, 80)
+                return
+              }
+            }
           }
           refresh()
           var observer = new MutationObserver(queueRefresh)
           observer.observe(document.body, { childList: true, subtree: true })
           return function () {
             active = false
+            if (timer) clearTimeout(timer)
             observer.disconnect()
           }
         }, [nodes])
@@ -243,6 +360,27 @@ window.__ModuleLoader__.load({
           ))
         }
         return portals
+      }
+
+      // eq for the useChat selector: content-level equality so the selected array
+      // keeps its reference across snapshots whose node set did not structurally
+      // change. A streaming frame that only refreshes node payloads therefore
+      // neither re-renders this component nor re-runs the observer effect.
+      //
+      // 注意：不能把 `sameNodeList` 放在 RestoreMessagePortals 内部——
+      // hook 行在函数声明提升之前执行时，词法作用域里的函数声明虽已提升，
+      // 但 useChat 的第二参必须是一个稳定可调用对象；放模块级最稳。
+      function sameNodeList(left, right) {
+        if (left === right) return true
+        if (left.length !== right.length) return false
+        for (var i = 0; i < left.length; i++) {
+          var a = left[i]
+          var b = right[i]
+          var av = ('key' in a && 'data' in a) ? a : { key: 'node', data: a }
+          var bv = ('key' in b && 'data' in b) ? b : { key: 'node', data: b }
+          if (av.key !== bv.key || av.data !== bv.data) return false
+        }
+        return true
       }
 
       function RestoreMessageAction(props) {
@@ -617,6 +755,13 @@ window.__ModuleLoader__.load({
           // 用与 findIconActions 相同的稳定策略定位操作行容器。
           var actions = findIconActions(row)
           if (!actions) continue
+          // DSH 0.1.6+ 的 CSS：有"后续 user/steering 行"的 user 行，其 .actions
+          // 默认 opacity:0（仅 hover/focus 显现），portal 进去的撤销按钮会跟着
+          // 不可见。给容器打 data-dtu-always，配合全局 [data-dtu-always]
+          // {opacity:1!important} 让注入按钮常显。
+          if (!actions.hasAttribute('data-dtu-always')) {
+            actions.setAttribute('data-dtu-always', '')
+          }
           targets.push({ container: actions, matched: target.matched })
         }
         return targets
