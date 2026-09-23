@@ -146,6 +146,10 @@ window.__ModuleLoader__.load({
           '.dtu-trigger{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}',
           '.dtu-trigger:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}',
           '.dtu-trigger:disabled{cursor:not-allowed;opacity:.5}',
+          // 点击后浏览器保留 :focus，hover 底色会「粘住」不恢复 —— 鼠标移开时
+          // 显式清掉 focus/active 态的背景与描边。
+          '.dtu-trigger:focus{outline:none}',
+          '.dtu-trigger:focus:not(:hover),.dtu-trigger:focus-visible:not(:hover),.dtu-trigger:active:not(:hover){background:transparent;color:var(--dsw-alias-label-tertiary)}',
           '.dtu-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:10000}',
           '.dtu-dialog{box-sizing:border-box;width:min(560px,100%);max-height:calc(100dvh - 48px);overflow:auto;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.2)}',
           '.dtu-body{display:flex;flex-direction:column;gap:14px;width:100%;min-width:0;max-width:100%;box-sizing:border-box;padding:18px}',
@@ -197,33 +201,7 @@ window.__ModuleLoader__.load({
         document.head.appendChild(styleEl)
       }
 
-      function openRestoredSession(sessionId, draftText) {
-        try {
-          ctx.sessions.open(sessionId)
-        } catch (error) {
-          console.warn('[turn-undo] openRestoredSession open failed:', error.message)
-          return
-        }
-        if (!draftText) return
-        function trySetDraft(remaining) {
-          if (remaining <= 0) return
-          try {
-            var scope = ctx.sessions.scope(sessionId)
-            if (scope !== undefined) {
-              ctx.conversation.input.for(scope).setDraft(draftText)
-              return
-            }
-          } catch (error) {
-            if (remaining <= 1) {
-              console.warn('[turn-undo] openRestoredSession setDraft failed:', error.message)
-            }
-          }
-          setTimeout(function () { trySetDraft(remaining - 1) }, 100)
-        }
-        trySetDraft(20)
-      }
-
-      ctx.inject(['slots', 'sessions', 'conversation'], function (scope) {
+      ctx.inject(['slots', 'conversation', 'uiWorkspace'], function (scope) {
         scope.effect(function () {
           return scope.slots.inject('conversation.session.header.actions', function () {
             return scope.slots.register({
@@ -231,13 +209,21 @@ window.__ModuleLoader__.load({
               id: 'turn-undo-portals',
               order: 100,
               inject: function () {
-                var sessionsSvc = scope.sessions
+                var workspaceSvc = scope.uiWorkspace
                 var conversationSvc = scope.conversation
                 return {
                   openRestoredSession: function (newSessionId, draftText) {
-                    // Open first: the input shell only exists after the session binding is materialized.
-                    if (sessionsSvc && sessionsSvc.open) {
-                      sessionsSvc.open(newSessionId)
+                    // 导航必须走 uiWorkspace：ISessions 没有 open()，
+                    // 旧的 sessionsSvc.open(...) 永远被 if 守卫静默跳过 —— 这正是
+                    // 「改名了但新会话没打开」的根因。
+                    try {
+                      if (workspaceSvc && typeof workspaceSvc.openSession === 'function') {
+                        workspaceSvc.openSession(newSessionId)
+                      } else {
+                        console.warn('[turn-undo] uiWorkspace.openSession unavailable; new session not opened')
+                      }
+                    } catch (e) {
+                      console.warn('[turn-undo] Failed to open restored session:', e.message)
                     }
                     if (!conversationSvc || !conversationSvc.input || !draftText) return
                     function trySetDraft(remaining) {
@@ -773,7 +759,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply
-    exports.inject = ['slots', 'sessions', 'conversation']
+    exports.inject = ['slots', 'conversation', 'uiWorkspace']
     return module.exports
   },
 })

@@ -41,8 +41,16 @@ export const name = 'turn-undo'
 export { SnapshotStore }
 
 // Injected services (via ctx.inject in apply()): webServer, sessions,
-// sessionQuery, agents, sessionController.
-export const inject = ['webServer', 'sessions', 'sessionQuery', 'agents', 'sessionTitle', 'sessionController']
+// sessionQuery, agents, sessionController, workspaceRegistry.
+export const inject = [
+  'webServer',
+  'sessions',
+  'sessionQuery',
+  'agents',
+  'sessionTitle',
+  'sessionController',
+  'workspaceRegistry',
+]
 
 // ---- Configuration defaults ----
 const DEFAULT_SNAPSHOT_TTL_DAYS = 7
@@ -768,11 +776,26 @@ function resolveForkBoundary(source, messageSeq, promptText) {
       return { boundary: null, turn: null, cwd, reason: 'no-turn-start' }
     }
     const previousEnd = events.findLast(e => e.type === 'turn/end' && e.seq < start.seq)
+
+    // 第一条消息（无前一个 turn/end）也必须 fork：边界取 turn/start 前
+    // 最近的一个「索引==seq」有效事件（会话初始化完成处），子会话继承
+    // workspace/preset/cwd，而不是 create() 一个空白会话 —— 这正是
+    // 「点击撤销后直接创建新会话、没有 fork 出会话」的根因。
+    let boundary = previousEnd ? previousEnd.seq : null
+    if (boundary !== null && !(events[boundary] && events[boundary].seq === boundary)) {
+      boundary = null
+    }
+    if (boundary === null) {
+      const startIdx = events.indexOf(start)
+      for (let i = startIdx - 1; i >= 0; i--) {
+        if (events[i] && events[i].seq === i) { boundary = i; break }
+      }
+    }
     return {
-      boundary: previousEnd ? previousEnd.seq : null,
+      boundary,
       turn,
       cwd,
-      reason: previousEnd ? 'ok' : 'no-previous-end',
+      reason: boundary !== null ? 'ok' : 'no-previous-end',
     }
   }
 
@@ -1038,20 +1061,55 @@ async function executeSurfaceRewind(agent, targetSeq) {
  *   no completed turn before it (e.g. the very first user message).
  * @returns the new child session id.
  */
+/**
+ * Find the workspace that owns `sessionId`, so a `cwd`-less `create()` can pass
+ * `workspaceId` and get attached to the workspace catalogue (visible in the
+ * sidebar). Mirrors upstream `SessionController.forkWorkspace`: only sessions
+ * already indexed as live are visible through `WorkspaceRegistry.list()`.
+ * @returns the owning workspace id, or `undefined` when the session is not
+ * indexed (caller then falls back to a `cwd`-only create).
+ */
+function findWorkspaceIdForSession(ctx, sessionId) {
+  try {
+    const registry = ctx.workspaceRegistry
+    if (!registry || typeof registry.list !== 'function') return undefined
+    for (const workspace of registry.list()) {
+      const ids = workspace && workspace.sessionIds
+      if (Array.isArray(ids) && ids.includes(sessionId)) return workspace.id
+    }
+  } catch (e) {
+    console.warn('[turn-undo] Workspace lookup failed (falling back to cwd):', e.message)
+  }
+  return undefined
+}
+
 async function forkAndMarkUndone(ctx, sessionId, messageSeq, promptText) {
   const source = await readSession(ctx, sessionId)
   if (!source) throw new Error('source session not found')
   const b = resolveForkBoundary(source, messageSeq, promptText)
 
+  console.info(
+    '[turn-undo] resolveBoundary session=' + sessionId,
+    'messageSeq=' + messageSeq,
+    'boundary=' + String(b.boundary),
+    'turn=' + String(b.turn),
+    'reason=' + b.reason,
+  )
   let childId
   if (typeof b.boundary === 'number') {
+    // fork() 会自动把子会话 attach 到 source 所在的 workspace（见上游
+    // commands.ts forkWorkspace），所以 fork 分支在侧栏可见。
     const { sessionId: cid } = await ctx.sessionController.fork({ sessionId, atSeq: b.boundary })
     childId = cid
   } else {
+    // create() 只有显式给 workspaceId 才会 attachSession；只给 cwd 的会话
+    // 不会进 workspace 目录，GUI 侧栏看不到 —— 这正是「原会话改名了但没有
+    // 新会话出现」的根因。所以先反查 source 所属 workspace。
     const cwd = source.header?.cwd
     if (!cwd) throw new Error('cannot undo first message without a cwd')
+    const workspaceId = findWorkspaceIdForSession(ctx, sessionId)
     const created = await ctx.sessionController.create({
-      cwd,
+      ...(workspaceId !== undefined ? { workspaceId } : { cwd }),
       ...(source.header?.agentPreset ? { agentPreset: source.header.agentPreset } : {}),
     })
     childId = created.sessionId
@@ -1123,7 +1181,20 @@ function createHandler(ctx, runtime, sessions, agents) {
           })
         }
 
-        const preview = runtime.store.preview(sessionId, targetTurn, getCwd(source))
+        let preview
+        try {
+          preview = runtime.store.preview(sessionId, targetTurn, getCwd(source))
+        } catch (e) {
+          logger?.warn?.('[turn-undo] preview failed:', e.message)
+          preview = {
+            ok: false,
+            status: 'preview-failed',
+            error: '预览失败：' + e.message,
+            targetTurn,
+            totalChanges: 0,
+            changes: [],
+          }
+        }
         return json(response, 200, preview)
       }
 
@@ -1260,17 +1331,20 @@ export function apply(ctx, config = {}) {
   })
 
   // HTTP API endpoints.
-  ctx.inject(['webServer', 'sessions', 'sessionQuery', 'agents', 'sessionTitle', 'sessionController'], (scope) => {
-    scope.effect(() => {
-      const handler = createHandler(scope, runtime, scope.sessions, scope.agents)
-      scope.webServer.register({
-        kind: 'exact',
-        path: API_PATH,
-        handler,
-      })
-      return () => {}
-    }, 'turn-undo: http-api')
-  })
+  ctx.inject(
+    ['webServer', 'sessions', 'sessionQuery', 'agents', 'sessionTitle', 'sessionController', 'workspaceRegistry'],
+    (scope) => {
+      scope.effect(() => {
+        const handler = createHandler(scope, runtime, scope.sessions, scope.agents)
+        scope.webServer.register({
+          kind: 'exact',
+          path: API_PATH,
+          handler,
+        })
+        return () => {}
+      }, 'turn-undo: http-api')
+    },
+  )
 }
 
 /**
