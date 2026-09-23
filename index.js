@@ -278,6 +278,7 @@ class SnapshotStore {
       sessionId,
       turn,
       timestamp: new Date().toISOString(),
+      cwd,
       totalBytes,
       manifest,
     }
@@ -546,6 +547,10 @@ class SnapshotStore {
    */
   restore(cwd, sessionId, targetTurn) {
     const chain = this.loadChain(sessionId)
+    // Use the cwd from the latest snapshot (captures the workspace root at
+    // capture time). This avoids cross-workspace bugs when the session's
+    // header.cwd has changed or is wrong (e.g. forked from another workspace).
+    const snapCwd = chain.length ? (chain[chain.length - 1].cwd ?? cwd) : cwd
     // Find the NEWEST snapshot whose turn <= targetTurn (best available state
     // at/before the boundary). Filter to only completed turns present.
     let target = null
@@ -559,7 +564,8 @@ class SnapshotStore {
     }
 
     // Restore files to the target manifest state.
-    const ignore = makeIgnore(cwd, this.excludes)
+    const resolveCwd = snapCwd || cwd
+    const ignore = makeIgnore(resolveCwd, this.excludes)
     const manifest = target.manifest
     const rels = Object.keys(manifest)
 
@@ -569,7 +575,7 @@ class SnapshotStore {
     // 1. Write back / refresh files present in target manifest.
     for (const rel of rels) {
       const entry = manifest[rel]
-      const abs = resolve(cwd, rel)
+      const abs = resolve(resolveCwd, rel)
       if (ignore(abs)) continue
       try {
         ensureDir(dirname(abs))
@@ -590,11 +596,11 @@ class SnapshotStore {
     // 2. Delete files present on disk but absent from the target manifest,
     //    except excluded dirs. Only within cwd. Uses a boundary-unlimited walk
     //    (unlike scan, whose caps would silently stop the pruning early).
-    const current = this.walkAll(cwd, ignore)
+    const current = this.walkAll(resolveCwd, ignore)
     const failedDeletions = []
     for (const abs of current) {
       if (ignore(abs)) continue
-      const rel = relative(cwd, abs).split('\\').join('/')
+      const rel = relative(resolveCwd, abs).split('\\').join('/')
       if (!(rel in manifest)) {
         try {
           rmSync(abs, { force: true })
@@ -1396,6 +1402,8 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
     return { ok: true, status: 'ready', targetTurn: null, totalChanges: 0, changes: [] }
   }
   const chain = this.loadChain(sessionId)
+  // Use cwd from latest snapshot to avoid cross-workspace path issues
+  const snapCwd = chain.length ? (chain[chain.length - 1].cwd ?? cwd) : cwd
   if (chain.length === 0) {
     return { ok: true, status: 'no-snapshot', targetTurn, totalChanges: 0, changes: [], noSnapshot: true }
   }
@@ -1427,8 +1435,8 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
   // preview shows meaningful changes even when the active turn has no snapshot.
   let latestManifest = latest.manifest
   let latestIsLive = false
-  if (targetTurn > latest.turn && cwd) {
-    const live = this.buildLiveManifest(cwd, latest.manifest)
+  if (targetTurn > latest.turn && snapCwd) {
+    const live = this.buildLiveManifest(snapCwd, latest.manifest)
     if (live) {
       latestManifest = live
       latestIsLive = true
