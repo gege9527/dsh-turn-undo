@@ -32,7 +32,7 @@ import {
   createWriteStream,
   createReadStream,
 } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { join, dirname, basename, relative, resolve } from 'node:path'
 
 export const name = 'turn-undo'
@@ -274,6 +274,22 @@ class SnapshotStore {
       return null
     }
 
+    // 记录本 turn 相对上一快照**变化了哪些文件**（changedRels）。
+    // 撤销恢复时只回滚这些文件——不是整个工作区在该时间段的所有改动，
+    // 否则会把其他会话/外部进程改过的文件也一并回退。
+    const changedRels = []
+    if (prevManifest) {
+      for (const rel of Object.keys(manifest)) {
+        const prev = prevManifest[rel]
+        if (!prev || prev.hash !== manifest[rel].hash || prev.mode !== manifest[rel].mode) {
+          changedRels.push(rel)
+        }
+      }
+      for (const rel of Object.keys(prevManifest)) {
+        if (!manifest[rel]) changedRels.push(rel) // 被删除的文件
+      }
+    }
+
     const manifestData = {
       sessionId,
       turn,
@@ -281,6 +297,7 @@ class SnapshotStore {
       cwd,
       totalBytes,
       manifest,
+      changedRels,
     }
     const mfPath = join(this.snapDir, sessionId, `${turn}.json`)
     writeJsonFile(mfPath, manifestData)
@@ -542,7 +559,9 @@ class SnapshotStore {
   }
 
   /**
-   * Restore the workspace at cwd to the state captured at or before targetTurn.
+   * Restore ONLY the files this session changed in turns AFTER the target
+   * message. Files the session never touched (other sessions, external
+   * processes, pre-existing state) are left alone.
    * Creates a safety snapshot first. Returns stats.
    */
   restore(cwd, sessionId, targetTurn) {
@@ -551,57 +570,83 @@ class SnapshotStore {
     // capture time). This avoids cross-workspace bugs when the session's
     // header.cwd has changed or is wrong (e.g. forked from another workspace).
     const snapCwd = chain.length ? (chain[chain.length - 1].cwd ?? cwd) : cwd
-    // Find the NEWEST snapshot whose turn <= targetTurn (best available state
-    // at/before the boundary). Filter to only completed turns present.
-    let target = null
+    // baseline = NEWEST snapshot strictly BEFORE the target message (the state
+    // right before that message was sent). turn/start snapshots are turn-0.5;
+    // the message's own turn/end snapshot is AFTER the message, so strictly < .
+    let baseline = null
     for (const m of chain) {
-      if (m.turn <= targetTurn && (target === null || m.turn > target.turn)) {
-        target = m
+      if (m.turn < targetTurn && (baseline === null || m.turn > baseline.turn)) {
+        baseline = m
       }
     }
-    if (!target) {
+    if (!baseline) {
       return { ok: false, error: 'NO_SNAPSHOT' }
     }
 
-    // Restore files to the target manifest state.
     const resolveCwd = snapCwd || cwd
     const ignore = makeIgnore(resolveCwd, this.excludes)
-    const manifest = target.manifest
-    const rels = Object.keys(manifest)
 
-    let restoredFiles = 0
-    let deletedFiles = 0
-    const skippedFiles = [] // Track files that couldn't be restored
-    // 1. Write back / refresh files present in target manifest.
-    for (const rel of rels) {
-      const entry = manifest[rel]
-      const abs = resolve(resolveCwd, rel)
-      if (ignore(abs)) continue
-      try {
-        ensureDir(dirname(abs))
-        if (entry.kind === 'file') {
-          const objPath = join(this.objDir, entry.hash)
-          if (!existsSync(objPath)) {
-            skippedFiles.push({ path: rel, reason: 'object_missing' })
-            continue
-          }
-          this.materializeObject(objPath, abs, entry.mode)
-          restoredFiles++
+    // 收集 (baseline.turn, latest.turn] 之间**每个快照相对上一快照变化过的文件**
+    // （changedRels）的并集 = 本会话在目标消息之后动过的文件。
+    //
+    // **只由已落盘快照决定**——不并入当前工作区状态（buildLiveManifest）。
+    // 共享 cwd 的多会话/外部进程会把别处改动混进快照链，但基线之后若
+    // **没有**新快照（纯对话 turn），本会话就没动过文件 → affected 为空。
+    const affected = new Map() // rel -> true
+    const baselineManifest = baseline.manifest
+    const latest = chain[chain.length - 1]
+    const latestManifest = latest.manifest
+    let hasSnapshotAfterBaseline = false
+    let anyChangedRels = false
+    for (const m of chain) {
+      if (m.turn <= baseline.turn) continue
+      hasSnapshotAfterBaseline = true
+      if (Array.isArray(m.changedRels) && m.changedRels.length) {
+        anyChangedRels = true
+        for (const rel of m.changedRels) affected.set(rel, true)
+      }
+    }
+    if (!hasSnapshotAfterBaseline) {
+      affected.clear()
+    } else if (!anyChangedRels) {
+      // 旧格式快照无 changedRels：退化到快照间 diff（baseline vs 最新快照）。
+      for (const rel of Object.keys(baselineManifest)) {
+        if (!latestManifest[rel] || latestManifest[rel].hash !== baselineManifest[rel].hash) {
+          affected.set(rel, true)
         }
-      } catch (e) {
-        skippedFiles.push({ path: rel, reason: 'materialize_failed', error: e.message })
+      }
+      for (const rel of Object.keys(latestManifest)) {
+        if (!baselineManifest[rel]) affected.set(rel, true)
       }
     }
 
-    // 2. Delete files present on disk but absent from the target manifest,
-    //    except excluded dirs. Only within cwd. Uses a boundary-unlimited walk
-    //    (unlike scan, whose caps would silently stop the pruning early).
-    const current = this.walkAll(resolveCwd, ignore)
+    let restoredFiles = 0
+    let deletedFiles = 0
+    const skippedFiles = []
     const failedDeletions = []
-    for (const abs of current) {
+
+    // 1. For each affected file: restore to the baseline (pre-message) state.
+    for (const rel of affected.keys()) {
+      const abs = resolve(resolveCwd, rel)
       if (ignore(abs)) continue
-      const rel = relative(resolveCwd, abs).split('\\').join('/')
-      if (!(rel in manifest)) {
+      const entry = baselineManifest[rel]
+      if (entry) {
+        try {
+          ensureDir(dirname(abs))
+          if (entry.kind === 'file') {
+            const objPath = join(this.objDir, entry.hash)
+            if (!existsSync(objPath)) {
+              skippedFiles.push({ path: rel, reason: 'object_missing' })
+              continue
+            }
+            this.materializeObject(objPath, abs, entry.mode)
+            restoredFiles++
+          }
+        } catch (e) {
+          skippedFiles.push({ path: rel, reason: 'materialize_failed', error: e.message })
+        }
+      } else {
+        // File did not exist at baseline (created after the target message): delete it.
         try {
           rmSync(abs, { force: true })
           deletedFiles++
@@ -610,7 +655,7 @@ class SnapshotStore {
         }
       }
     }
-    // If any deletions failed, mark the restore as partially failed
+
     if (failedDeletions.length > 0) {
       console.warn('[turn-undo] restore failed to delete', failedDeletions.length, 'files:', failedDeletions.map(f => f.path).join(', '))
     }
@@ -622,8 +667,8 @@ class SnapshotStore {
       skippedFiles,
       failedDeletions,
       targetTurn,
-      restoredTurn: target.turn,
-      totalFiles: rels.length,
+      restoredTurn: baseline.turn,
+      totalFiles: affected.size,
     }
     // Log skipped files for debugging
     if (skippedFiles.length > 0) {
@@ -631,6 +676,7 @@ class SnapshotStore {
     }
     return result
   }
+
 
   /**
    * Clean old snapshots (TTL + per-session cap).
@@ -993,10 +1039,43 @@ function markerStepOf(events, turn) {
 }
 
 /**
+ * Read a live Session's full event log without touching deprecated APIs.
+ * DSH marks `session.eventAt` / `snapshotEvents` deprecated but still
+ * functional (new calls discouraged); `session.events` does not exist on
+ * current builds. Prefer `snapshotEvents()`, fall back to `events`.
+ * @param session - live Session instance.
+ * @returns the event array (contiguous seq order).
+ */
+function snapshotEventsOf(session) {
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return session.events ?? []
+}
+
+/**
  * Compute the surface replacement plan for a rewind target.
  * DSH 0.1.2+ 的 session.surface.nodes 是 seq 数字数组（number[]）；
  * 旧版可能是 { seq } 对象数组，这里两种都兼容。
  */
+/**
+ * Compute the turn numbers belonging to a shadow range starting at targetSeq.
+ * targetTurn is the last turn/start with seq less than targetSeq;
+ * shadowedTurns are all turn/start events with seq greater or equal.
+ * Returns a deduplicated array; empty if no turn/start found.
+ */
+function turnsForShadow(events, targetSeq) {
+  if (!Array.isArray(events)) return []
+  const out = []
+  let targetTurn = null
+  for (const ev of events) {
+    if (ev.type === 'turn/start' && ev.data && typeof ev.data.turn === 'number') {
+      if (ev.seq < targetSeq) targetTurn = ev.data.turn
+      else out.push(ev.data.turn)
+    }
+  }
+  if (targetTurn !== null) out.unshift(targetTurn)
+  return Array.from(new Set(out))
+}
+
 function planSurfaceRewind(events, surfaceNodes, targetSeq) {
   // 归一化 surface 节点为数字 seq 列表（DSH 0.1.2+ 的 surface.nodes 是 number[]，
   // 旧版可能是 { seq } 对象索引形式）。
@@ -1004,52 +1083,81 @@ function planSurfaceRewind(events, surfaceNodes, targetSeq) {
     ? surfaceNodes.slice()
     : surfaceNodes.map(n => n.seq)
 
-  // 丢弃从该消息开始之后的 surface 节点：找到第一个 seq >= targetSeq 的节点并全部截断。
-  // 不用精确 indexOf(targetSeq)——当 user 消息已被后续 replace 遮蔽、或 messageSeq
-  // 介于两个 surface 节点之间时，精确匹配会失败而报 target seq not on surface；
-  // at-or-after 策略从该消息或其后的最近 surface 节点截断，仍实现恢复到发送这条消息之前。
-  const dropFrom = seqList.findIndex(s => s >= targetSeq)
+  // surface.nodes 的顺序**不可靠**（compaction 后会重排/插入 checkpoint），
+  // 不能依赖 indexOf/slice 的原始顺序。统一**排序（升序）**后再定位。
+  const sorted = seqList.slice().sort((a, b) => a - b)
+  let dropFrom = sorted.findIndex(s => s >= targetSeq)
   if (dropFrom === -1) {
-    throw new Error('target seq ' + targetSeq + ' not on surface')
+    // 所有节点 seq 都 < targetSeq：target 比最老的还早，遮蔽全部。
+    dropFrom = 0
   }
-  const shadowedSeqs = seqList.slice(dropFrom)
+  // replace op 遮蔽的 surface 节点：必须是 surface 上真实存在的节点。
+  const surfaceShadowed = sorted.slice(dropFrom)
+  if (surfaceShadowed.length === 0) {
+    throw new Error('no surface nodes to shadow after target seq ' + targetSeq)
+  }
+
+  // 报告给 client 的 shadowedSeqs：**必须包含 targetSeq 本身**。
+  // target 消息可能已被 compaction 遮蔽（不在 surface 上），但 UI 仍显示它；
+  // surface replace 只处理 surface 节点，UI 隐藏则要按 seq 隐藏 target 行。
+  const shadowedSeqs = Array.from(new Set([targetSeq, ...surfaceShadowed])).sort((a, b) => a - b)
+
+  // 计算要隐藏的 turn 号集合（DOM 层按 data-chat-turn 隐藏 turn-process seat）。
+  // AI 回复嵌在 turn-process 节点里，seat 没有自己的节点 seq，只能按 turn 定位。
+  const shadowedTurns = turnsForShadow(events, targetSeq)
+
   return {
     targetSeq,
     targetIndex: dropFrom,
     shadowedSeqs,
-    surfaceStart: shadowedSeqs[0],
-    surfaceEnd: shadowedSeqs[shadowedSeqs.length - 1],
+    shadowedTurns,
+    surfaceStart: surfaceShadowed[0],
+    surfaceEnd: surfaceShadowed[surfaceShadowed.length - 1],
   }
 }
 
 /**
- * Rewind one live session's surface to before a target user message, in place:
- * append a ghost step/marker assistant/message carrying surfaceOp.replace that
- * drops every surface node from target onwards. No fork.
+ * Rewind one live session's surface to before a target user message, in place.
+ *
+ * Appends ONE `user/message` carrying `surfaceOp: { op: 'replace', startSeq, endSeq }`
+ * — the exact shape DSH's own compaction uses (compaction-basic/src/region.ts:506).
+ * The replacement shadows every surface node from the target onwards, so:
+ *   - `deriveMessages()` stops producing them → the MODEL loses that tail;
+ *   - the web transcript only renders `isAppendSurfaceEvent` nodes
+ *     (ui-chat/conversation-nodes/message.ts:67) → the UI hides that tail too.
+ * The append-only log keeps every original event — nothing is deleted.
+ *
+ * Constraints (surface.ts): the replacement must be a `user/message`,
+ * `startSeq`/`endSeq` must be CURRENT surface nodes, and `sourceEventSeqs`
+ * must cover every shadowed surface node (superset allowed, subset rejected).
+ *
+ * @param agent - live Agent resolved via sessionController.resolveAgent.
+ * @param targetSeq - seq of the target user message (the rewind point).
+ * @returns the applied plan (shadowedSeqs + surface range).
  */
 async function executeSurfaceRewind(agent, targetSeq) {
   const session = agent.session
-  const surfaceNodes = session.surface?.nodes || []
-  if (!surfaceNodes || surfaceNodes.length === 0) {
-    throw new Error('no surface nodes available')
-  }
-  const plan = planSurfaceRewind(session.events || [], surfaceNodes, targetSeq)
-  const turn = markerTurnOf(session.events || [])
-  const step = markerStepOf(session.events || [], turn)
+  const surfaceNodes = session.surface?.nodes ?? []
+  if (surfaceNodes.length === 0) throw new Error('no surface nodes available')
 
-  agent.session.append('step/start', { turn, step })
-  try {
-    const marker = {
-      content: [],
-      source: { provider: 'turn-undo', model: 'rewind-marker' },
-    }
-    agent.session.append('assistant/message', { turn, step, message: marker }, {
-      surfaceOp: { op: 'replace', start: plan.surfaceStart, end: plan.surfaceEnd },
-      sourceEventSeqs: plan.shadowedSeqs,
-    })
-  } finally {
-    agent.session.append('step/end', { turn, step })
+  const plan = planSurfaceRewind(snapshotEventsOf(session), surfaceNodes, targetSeq)
+
+  // A replacement lands in the surface as a user-role checkpoint. Empty content
+  // keeps it model-invisible (no tokens) while still shadowing the range.
+  //
+  // MUST include `role: 'user'` — DSH validates user/message role on restore,
+  // and createUserMessage() auto-injects it (packages/llm/llm/src/message.ts:251).
+  // Without role, the session is marked corrupt on next load.
+  const marker = {
+    id: randomUUID(),
+    role: 'user',
+    content: [],
+    source: { kind: 'user' },
   }
+  session.append('user/message', marker, {
+    surfaceOp: { op: 'replace', startSeq: plan.surfaceStart, endSeq: plan.surfaceEnd },
+    sourceEventSeqs: plan.shadowedSeqs,
+  })
 
   return plan
 }
@@ -1155,6 +1263,39 @@ function createHandler(ctx, runtime, sessions, agents) {
 
         if (!sessionId) return json(response, 400, { error: 'Missing sessionId' })
 
+        // /state 端点：读 session log 里所有 surfaceOp.replace marker，
+        // 返回被遮蔽的 seq 列表（client 启动/切会话时拉取，用于恢复 DOM 隐藏）。
+        if (url.pathname === API_PATH + '/state') {
+          try {
+            const source = await readSession(ctx, sessionId)
+            if (!source) return json(response, 404, { error: 'Session not found' })
+            const events = Array.isArray(source.events) ? source.events : []
+            const hidden = new Set()
+            const hiddenTurns = new Set()
+            for (const ev of events) {
+              // 只统计**撤销 marker**，排除 DSH compaction checkpoint：
+              // 两者都是 user/message + surfaceOp.replace，但我们的撤销 marker
+              // 是空 content；compaction checkpoint 带 summary 文本（非空）。
+              if (ev.type === 'user/message' && ev.surfaceOp && ev.surfaceOp.op === 'replace'
+                  && Array.isArray(ev.content) && ev.content.length === 0) {
+                const srcs = ev.sourceEventSeqs
+                if (Array.isArray(srcs)) {
+                  for (const s of srcs) hidden.add(s)
+                  // 最小 seq 即该 replace 的 targetSeq，算出要隐藏的 turn 号
+                  if (srcs.length) {
+                    const tseq = Math.min.apply(null, srcs)
+                    for (const t of turnsForShadow(events, tseq)) hiddenTurns.add(t)
+                  }
+                }
+              }
+            }
+            return json(response, 200, { ok: true, hiddenSeqs: Array.from(hidden), hiddenTurns: Array.from(hiddenTurns) })
+          } catch (e) {
+            console.error('[turn-undo] /state failed:', e.message)
+            return json(response, 200, { ok: true, hiddenSeqs: [], hiddenTurns: [] })
+          }
+        }
+
         // 单次 readSession 即可：live 会话的 snapshotEvents() 会重放事件，
         // 每个请求读两遍是纯浪费。
         const source = await readSession(ctx, sessionId)
@@ -1164,8 +1305,10 @@ function createHandler(ctx, runtime, sessions, agents) {
         let unresolved = null
         if (messageSeqParam) {
           const b = resolveForkBoundary(source, parseInt(messageSeqParam, 10), promptTextParam)
-          // For preview, pass the turn that the user wants to undo (b.turn).
-          if (b.turn !== null && b.turn > 0) targetTurn = b.turn
+          // For preview, pass the turn that the user wants to undo (b.turn),
+          // SAME restore boundary as POST: b.turn - 0.5 (state before the
+          // message's turn/start). Keeps preview and restore consistent.
+          if (b.turn !== null && b.turn > 0) targetTurn = b.turn - 0.5
           else unresolved = b.reason ?? 'no-turn'
         }
 
@@ -1215,6 +1358,8 @@ function createHandler(ctx, runtime, sessions, agents) {
         const sessionId = data.sessionId
         const messageSeq = data.messageSeq ? parseInt(data.messageSeq, 10) : null
         const promptText = data.promptText || null
+        // 只回退对话（不动文件）时客户端传 restoreFiles:false；缺省/undefined = 回退文件。
+        const restoreFiles = data.restoreFiles !== false
         if (!sessionId) return json(response, 400, { error: 'Missing sessionId' })
 
         const source = await readSession(ctx, sessionId)
@@ -1245,31 +1390,40 @@ function createHandler(ctx, runtime, sessions, agents) {
         //    empty snapshot chain and skip file restoration.
         try { await runtime.waitForSnapshots() } catch {}
 
-        // 3.5 Safety snapshot: before this irreversible restore wipes files,
-        //    force-capture the CURRENT workspace into the session chain (as a
-        //    fractional turn just past the newest snapshot) so the user can
-        //    restore again to the pre-undo state if needed. Non-fatal on failure.
-        try {
-          const chain = runtime.store.loadChain(sessionId)
-          const lastTurn = chain.length ? chain[chain.length - 1].turn : 0
-          await runtime.captureNow(cwd, sessionId, lastTurn + 0.999)
-        } catch (e) {
-          console.warn('[turn-undo] safety snapshot failed (non-fatal):', e?.message)
+        // 3.5-4. 文件恢复：仅在用户勾选"同时回退文件"时执行。
+        //    restoreFiles=false = 只回退对话（surface replace），不动任何文件。
+        let restoreResult
+        if (restoreFiles) {
+          // Safety snapshot: before this irreversible restore wipes files,
+          //    force-capture the CURRENT workspace into the session chain (as a
+          //    fractional turn just past the newest snapshot) so the user can
+          //    restore again to the pre-undo state if needed. Non-fatal on failure.
+          try {
+            const chain = runtime.store.loadChain(sessionId)
+            const lastTurn = chain.length ? chain[chain.length - 1].turn : 0
+            await runtime.captureNow(cwd, sessionId, lastTurn + 0.999)
+          } catch (e) {
+            console.warn('[turn-undo] safety snapshot failed (non-fatal):', e?.message)
+          }
+          restoreResult = runtime.store.restore(cwd, sessionId, restoreTurn)
+        } else {
+          restoreResult = { ok: true, skipped: true, reason: 'files-disabled', restoredFiles: 0, deletedFiles: 0 }
         }
 
-        // 4. Restore files to the best snapshot at/before restoreTurn.
-        const restoreResult = runtime.store.restore(cwd, sessionId, restoreTurn)
-
-        // 5. Fork 新会话（DSH 原生，web 的在此分叉按钮同款：ctx.agents.create），
-        //    并把旧会话标题加上 （已撤销） 前缀后保留。
-        let newSessionId = null
+        // 5. 原会话就地回退（surface replace，不 fork、不新建会话、不改名）。
+        //    追加一条 user/message + surfaceOp.replace，遮蔽目标消息及之后的
+        //    全部 surface 节点 —— LLM 上下文与 web 转录同步回退，sessionId 不变。
+        let rewindPlan = null
+        let resolved = null
         try {
-          newSessionId = await forkAndMarkUndone(ctx, sessionId, messageSeq, promptText)
+          resolved = await ctx.sessionController.resolveAgent(sessionId)
+          if ('error' in resolved) throw resolved.error
+          rewindPlan = await executeSurfaceRewind(resolved.agent, messageSeq)
         } catch (e) {
-          console.error('[turn-undo] Fork failed:', e.message)
+          console.error('[turn-undo] Surface rewind failed:', e.message)
           return json(response, 200, {
             ok: false,
-            status: 'fork-failed',
+            status: 'rewind-failed',
             error: e.message,
             restore: restoreResult && {
               ok: restoreResult.ok === true,
@@ -1278,13 +1432,29 @@ function createHandler(ctx, runtime, sessions, agents) {
           })
         }
 
+        // 持久化：把标记事件落盘，重启后重放仍保持回退状态。
+        try {
+          await ctx.sessions.flush(resolved.agent.session)
+        } catch (e) {
+          console.warn('[turn-undo] flush failed (non-fatal):', e?.message)
+        }
+
         return json(response, 200, {
           ok: true,
           status: 'completed',
-          newSessionId,
+          sessionId,                       // 原会话 id（就地回退，无新会话）
+          newSessionId: null,              // 保持 client 兼容：null = 未 fork
+          rewind: {
+            targetSeq: rewindPlan.targetSeq,
+            shadowedCount: rewindPlan.shadowedSeqs.length,
+            surfaceStart: rewindPlan.surfaceStart,
+            surfaceEnd: rewindPlan.surfaceEnd,
+            shadowedSeqs: rewindPlan.shadowedSeqs,
+            shadowedTurns: rewindPlan.shadowedTurns,
+          },
           restore: {
             ok: restoreResult?.ok === true,
-            skipped: restoreResult?.error === 'NO_SNAPSHOT',
+            skipped: restoreResult?.error === 'NO_SNAPSHOT' || restoreResult?.reason === 'files-disabled',
             restoredFiles: restoreResult?.restoredFiles ?? 0,
             deletedFiles: restoreResult?.deletedFiles ?? 0,
           },
@@ -1345,6 +1515,12 @@ export function apply(ctx, config = {}) {
         scope.webServer.register({
           kind: 'exact',
           path: API_PATH,
+          handler,
+        })
+        // /state 子路径：client 启动/切会话时拉取，恢复历史撤销的 DOM 隐藏。
+        scope.webServer.register({
+          kind: 'exact',
+          path: API_PATH + '/state',
           handler,
         })
         return () => {}
@@ -1443,20 +1619,51 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
     }
   }
 
-  // ── Collect changed paths FIRST ───────────────────────────────────────
-  // Contents are read only for files whose hash differs; reading every object
-  // in both manifests made one preview cost hundreds of file reads.
+  // ── Collect changed paths: ONLY the session's own changes ─────────────
+  // 与 restore() 一致：只看 (baseline.turn, latest.turn] 之间各快照的
+  // changedRels 并集（本会话动过的文件）。
+  //
+  // **绝不**并入 live（buildLiveManifest）——那会扫描整个工作区的当前状态，
+  // 把**其他会话/外部进程**（如另一个 DSH 会话在 cwd 里改文件）产生的改动
+  // 都算成"本会话的"。affected 只由已落盘的快照链决定：
+  //  - 基线之后**没有**新快照 → 本会话没产生文件变化 → affected 为空
+  //  - 有快照但都无 changedRels（旧快照）→ 退化到快照间 diff（不用 live）
+  const affected = new Set()
+  let hasSnapshotAfterBaseline = false
+  for (const m of chain) {
+    if (m.turn <= baseline.turn) continue
+    hasSnapshotAfterBaseline = true
+    if (Array.isArray(m.changedRels) && m.changedRels.length) {
+      for (const rel of m.changedRels) affected.add(rel)
+    }
+  }
+  if (!hasSnapshotAfterBaseline) {
+    // 纯对话 turn（未产生 turn/end 快照）或目标消息就是最后一个：无文件变化。
+    affected.clear()
+  } else if (affected.size === 0) {
+    // 旧格式快照无 changedRels：用快照间 diff（baseline vs 最新快照），不用 live。
+    const snapLatest = latest.manifest
+    for (const rel of Object.keys(baselineManifest)) {
+      if (!snapLatest[rel] || snapLatest[rel].hash !== baselineManifest[rel].hash) {
+        affected.add(rel)
+      }
+    }
+    for (const rel of Object.keys(snapLatest)) {
+      if (!baselineManifest[rel]) affected.add(rel)
+    }
+  }
+
   const deleted = []
   const created = []
   const modified = []
-  for (const rel of Object.keys(baselineManifest)) {
-    if (!latestManifest[rel]) deleted.push({ path: rel, hash: baselineManifest[rel].hash })
-  }
-  for (const rel of Object.keys(latestManifest)) {
-    const entry = latestManifest[rel]
+  for (const rel of affected) {
     const prev = baselineManifest[rel]
-    if (!prev) created.push({ path: rel, hash: entry.hash })
-    else if (entry.hash !== prev.hash) modified.push({ path: rel, oldHash: prev.hash, newHash: entry.hash })
+    const entry = latestManifest[rel]
+    if (!prev && entry) created.push({ path: rel, hash: entry.hash })
+    else if (prev && !entry) deleted.push({ path: rel, hash: prev.hash })
+    else if (prev && entry && entry.hash !== prev.hash) {
+      modified.push({ path: rel, oldHash: prev.hash, newHash: entry.hash })
+    }
   }
 
   const changes = []
