@@ -9,9 +9,12 @@
  *      sha256, hardlink-reusing unchanged files) into $DSH_HOME/turn-undo/.
  *   3. Restore = fetch a target turn's manifest, align the workspace to it
  *      (write back + delete extra files), skipping excluded dirs.
- *   4. Rewind in place via session.surface replacement (surfaceOp.replace): drop
- *      every surface node from the target user message onwards — no fork, no new
- *      session, and no cancel/rename (both removed in DSH 0.1.2+).
+ *   4. Undo = fork: create a child session from the event prefix BEFORE the
+ *      target message via `sessionController.fork` (the same RPC as the web
+ *      UI fork button), then rename and archive the old session so it can no
+ *      longer be continued. The child log physically omits the undone events
+ *      — model context, web transcript and restarts all agree, so no surface
+ *      shadowing and no client-side DOM hiding are needed.
  */
 
 
@@ -32,7 +35,7 @@ import {
   createWriteStream,
   createReadStream,
 } from 'node:fs'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { join, dirname, basename, relative, resolve } from 'node:path'
 
 export const name = 'turn-undo'
@@ -41,15 +44,13 @@ export const name = 'turn-undo'
 export { SnapshotStore }
 
 // Injected services (via ctx.inject in apply()): webServer, sessions,
-// sessionQuery, agents, sessionController, workspaceRegistry.
+// sessionQuery, sessionController, workspaceController.
 export const inject = [
   'webServer',
   'sessions',
   'sessionQuery',
-  'agents',
-  'sessionTitle',
   'sessionController',
-  'workspaceRegistry',
+  'workspaceController',
 ]
 
 // ---- Configuration defaults ----
@@ -131,6 +132,38 @@ function json(res, status, value) {
 
 function getCwd(source) {
   return source?.header?.cwd
+}
+
+/**
+ * Explicit-service variant of readSession for the HTTP handler.
+ *
+ * The handler runs long after the inject scope's effect — its fiber may be in
+ * a LOADING/UNLOADING window (config reload / HMR) where fiber.store is
+ * undefined. Resolving services lazily through scope.sessions then throws
+ * 'cannot get required service "sessions" in inactive context'. The services
+ * are captured as plain references at handler-creation time, so the request
+ * path never touches the fiber proxy.
+ */
+async function readSessionLive(sessions, sessionQuery, sessionId) {
+  const live = sessions?.get?.(sessionId)
+  if (live) {
+    return {
+      id: sessionId,
+      header: live.header || {},
+      events: typeof live.snapshotEvents === 'function'
+        ? live.snapshotEvents(0, live.seq)
+        : (live.events || []),
+    }
+  }
+  const stored = await sessionQuery?.readSession?.(sessionId)
+  if (stored) {
+    return {
+      id: sessionId,
+      header: stored.session || {},
+      events: stored.events || [],
+    }
+  }
+  return null
 }
 
 async function readSession(ctx, sessionId) {
@@ -680,6 +713,10 @@ class SnapshotStore {
 
   /**
    * Clean old snapshots (TTL + per-session cap).
+   *
+   * 性能：`sweepObjects()` 是 mark-and-sweep 全对象库扫描（可达数百 MB /
+   * 数万文件），不能每次 capture 都跑。由 enqueueCapture 节流调用
+   * （cleanupThrottleMs 内的清理只做快照 TTL/数量裁剪，不做对象 GC）。
    */
   cleanup() {
     const now = Date.now()
@@ -705,8 +742,9 @@ class SnapshotStore {
       }
     }
     // Manifests are pruned above; reclaim the objects they no longer reference.
-    // Without this the content-addressed store grows forever (an observed store
-    // reached 983 MB / 40k files whose manifests had long been deleted).
+    // sweepObjects() 自带 `objectGcIntervalMs`（默认 6h）节流，不会每次
+    // capture 都做全库 mark-and-sweep——那是最重的操作（可达 983 MB / 40k
+    // 文件）。这里直接委托它，由其内部节流决定是否真正扫描。
     try { this.sweepObjects() } catch (e) {
       console.warn('[turn-undo] object sweep failed:', e.message)
     }
@@ -794,7 +832,7 @@ function numeric(a, b) {
 }
 
 // ===========================================================================
-// Boundary / fork resolution (mirrors dsh-turn-rewind messageTarget)
+// Boundary / fork resolution
 // ===========================================================================
 
 /**
@@ -923,23 +961,6 @@ function resolveForkBoundary(source, messageSeq, promptText) {
   return { boundary, turn, cwd, reason: 'ok' }
 }
 
-/**
- * Archive an old session after a successful fork+restore: cancel it.
- * Cancelling removes the old session so it doesn't conflict with the forked one.
- * If cancel fails, we rename it as a last resort.
- */
-async function archiveSession(ctx, sessionId) {
-  // DSH 0.1.2+ 移除了 cancel/rename/getProjection；当前为 surface 原地回滚，
-  // 不产生新会话，无需归档。此处保留为安全的 no-op 提示。
-  try {
-    console.info('[turn-undo] Session', sessionId, 'rewound in place; no archive needed')
-    return true
-  } catch (error) {
-    console.warn('[turn-undo] Archive failed:', error.message)
-    return false
-  }
-}
-
 // ===========================================================================
 // Snapshot runtime (turn/end listener)
 // ===========================================================================
@@ -1013,246 +1034,88 @@ class SnapshotRuntime {
 function wait(ms) { return new Promise(r => setTimeout(r, ms)) }
 
 // ===========================================================================
-// Surface rewind utilities (P0-1: markerTurnOf, markerStepOf, planSurfaceRewind)
-// ===========================================================================
-
-/** Turn number for the rewind marker (reuse last started turn, never collides with a future turn/start). */
-function markerTurnOf(events) {
-  let lastStarted = 0
-  for (const event of events) {
-    if (event.type === 'turn/start' && event.data?.turn > lastStarted) {
-      lastStarted = event.data.turn
-    }
-  }
-  return lastStarted
-}
-
-/** Step number for the marker's ghost step frame (lastStarted + 1 is always safe). */
-function markerStepOf(events, turn) {
-  let lastStarted = 0
-  for (const event of events) {
-    if (event.type === 'step/start' && event.data?.turn === turn && event.data?.step > lastStarted) {
-      lastStarted = event.data.step
-    }
-  }
-  return lastStarted + 1
-}
-
-/**
- * Read a live Session's full event log without touching deprecated APIs.
- * DSH marks `session.eventAt` / `snapshotEvents` deprecated but still
- * functional (new calls discouraged); `session.events` does not exist on
- * current builds. Prefer `snapshotEvents()`, fall back to `events`.
- * @param session - live Session instance.
- * @returns the event array (contiguous seq order).
- */
-function snapshotEventsOf(session) {
-  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
-  return session.events ?? []
-}
-
-/**
- * Compute the surface replacement plan for a rewind target.
- * DSH 0.1.2+ 的 session.surface.nodes 是 seq 数字数组（number[]）；
- * 旧版可能是 { seq } 对象数组，这里两种都兼容。
- */
-/**
- * Compute the turn numbers belonging to a shadow range starting at targetSeq.
- * targetTurn is the last turn/start with seq less than targetSeq;
- * shadowedTurns are all turn/start events with seq greater or equal.
- * Returns a deduplicated array; empty if no turn/start found.
- */
-function turnsForShadow(events, targetSeq) {
-  if (!Array.isArray(events)) return []
-  const out = []
-  let targetTurn = null
-  for (const ev of events) {
-    if (ev.type === 'turn/start' && ev.data && typeof ev.data.turn === 'number') {
-      if (ev.seq < targetSeq) targetTurn = ev.data.turn
-      else out.push(ev.data.turn)
-    }
-  }
-  if (targetTurn !== null) out.unshift(targetTurn)
-  return Array.from(new Set(out))
-}
-
-function planSurfaceRewind(events, surfaceNodes, targetSeq) {
-  // 归一化 surface 节点为数字 seq 列表（DSH 0.1.2+ 的 surface.nodes 是 number[]，
-  // 旧版可能是 { seq } 对象索引形式）。
-  const seqList = surfaceNodes.length > 0 && typeof surfaceNodes[0] === 'number'
-    ? surfaceNodes.slice()
-    : surfaceNodes.map(n => n.seq)
-
-  // surface.nodes 的顺序**不可靠**（compaction 后会重排/插入 checkpoint），
-  // 不能依赖 indexOf/slice 的原始顺序。统一**排序（升序）**后再定位。
-  const sorted = seqList.slice().sort((a, b) => a - b)
-  let dropFrom = sorted.findIndex(s => s >= targetSeq)
-  if (dropFrom === -1) {
-    // 所有节点 seq 都 < targetSeq：target 比最老的还早，遮蔽全部。
-    dropFrom = 0
-  }
-  // replace op 遮蔽的 surface 节点：必须是 surface 上真实存在的节点。
-  const surfaceShadowed = sorted.slice(dropFrom)
-  if (surfaceShadowed.length === 0) {
-    throw new Error('no surface nodes to shadow after target seq ' + targetSeq)
-  }
-
-  // 报告给 client 的 shadowedSeqs：**必须包含 targetSeq 本身**。
-  // target 消息可能已被 compaction 遮蔽（不在 surface 上），但 UI 仍显示它；
-  // surface replace 只处理 surface 节点，UI 隐藏则要按 seq 隐藏 target 行。
-  const shadowedSeqs = Array.from(new Set([targetSeq, ...surfaceShadowed])).sort((a, b) => a - b)
-
-  // 计算要隐藏的 turn 号集合（DOM 层按 data-chat-turn 隐藏 turn-process seat）。
-  // AI 回复嵌在 turn-process 节点里，seat 没有自己的节点 seq，只能按 turn 定位。
-  const shadowedTurns = turnsForShadow(events, targetSeq)
-
-  return {
-    targetSeq,
-    targetIndex: dropFrom,
-    shadowedSeqs,
-    shadowedTurns,
-    surfaceStart: surfaceShadowed[0],
-    surfaceEnd: surfaceShadowed[surfaceShadowed.length - 1],
-  }
-}
-
-/**
- * Rewind one live session's surface to before a target user message, in place.
- *
- * Appends ONE `user/message` carrying `surfaceOp: { op: 'replace', startSeq, endSeq }`
- * — the exact shape DSH's own compaction uses (compaction-basic/src/region.ts:506).
- * The replacement shadows every surface node from the target onwards, so:
- *   - `deriveMessages()` stops producing them → the MODEL loses that tail;
- *   - the web transcript only renders `isAppendSurfaceEvent` nodes
- *     (ui-chat/conversation-nodes/message.ts:67) → the UI hides that tail too.
- * The append-only log keeps every original event — nothing is deleted.
- *
- * Constraints (surface.ts): the replacement must be a `user/message`,
- * `startSeq`/`endSeq` must be CURRENT surface nodes, and `sourceEventSeqs`
- * must cover every shadowed surface node (superset allowed, subset rejected).
- *
- * @param agent - live Agent resolved via sessionController.resolveAgent.
- * @param targetSeq - seq of the target user message (the rewind point).
- * @returns the applied plan (shadowedSeqs + surface range).
- */
-async function executeSurfaceRewind(agent, targetSeq) {
-  const session = agent.session
-  const surfaceNodes = session.surface?.nodes ?? []
-  if (surfaceNodes.length === 0) throw new Error('no surface nodes available')
-
-  const plan = planSurfaceRewind(snapshotEventsOf(session), surfaceNodes, targetSeq)
-
-  // A replacement lands in the surface as a user-role checkpoint. Empty content
-  // keeps it model-invisible (no tokens) while still shadowing the range.
-  //
-  // MUST include `role: 'user'` — DSH validates user/message role on restore,
-  // and createUserMessage() auto-injects it (packages/llm/llm/src/message.ts:251).
-  // Without role, the session is marked corrupt on next load.
-  const marker = {
-    id: randomUUID(),
-    role: 'user',
-    content: [],
-    source: { kind: 'user' },
-  }
-  session.append('user/message', marker, {
-    surfaceOp: { op: 'replace', startSeq: plan.surfaceStart, endSeq: plan.surfaceEnd },
-    sourceEventSeqs: plan.shadowedSeqs,
-  })
-
-  return plan
-}
-
-// ===========================================================================
-// Fork + mark-undone
+// Fork + archive (undo = fork child + archive old)
 // ===========================================================================
 /**
- * Fork a new child session at the message via DSH SessionController,
- * then mark the OLD session undone.
+ * Fork a child session from the event prefix BEFORE the target message, then
+ * rename + archive the old session.
  *
- * - Uses the same `sessionController.fork` RPC as the web UI's
- *   "Branch into a new conversation" / "Fork session" buttons.
- * - Falls back to `sessionController.create` when the target message has
- *   no completed turn before it (e.g. the very first user message).
- * @returns the new child session id.
+ * - Uses the same `sessionController.fork` RPC as the web UI fork buttons;
+ *   DSH `buildForkSeed` copies prefix [0..boundary] and closes the open tail
+ *   with synthetic `forked` closers, so the child log physically contains NONE
+ *   of the undone events. Model context, web transcript and restart all agree
+ *   — this is a real undo, not a surface shadow (no DOM hiding needed).
+ * - Falls back to `sessionController.create` only when no fork boundary exists
+ *   (defensive; the POST handler already rejects boundary-less targets).
+ * - Old session: rename with a （已撤销） prefix (best-effort), then archive via
+ *   `workspaceController.archiveSession` so it leaves the active session list
+ *   and can no longer be continued.
+ *
+ * @returns {{ newSessionId: string, createFallback: boolean, renamed: boolean, archived: boolean }}
  */
-/**
- * Find the workspace that owns `sessionId`, so a `cwd`-less `create()` can pass
- * `workspaceId` and get attached to the workspace catalogue (visible in the
- * sidebar). Mirrors upstream `SessionController.forkWorkspace`: only sessions
- * already indexed as live are visible through `WorkspaceRegistry.list()`.
- * @returns the owning workspace id, or `undefined` when the session is not
- * indexed (caller then falls back to a `cwd`-only create).
- */
-function findWorkspaceIdForSession(ctx, sessionId) {
-  try {
-    const registry = ctx.workspaceRegistry
-    if (!registry || typeof registry.list !== 'function') return undefined
-    for (const workspace of registry.list()) {
-      const ids = workspace && workspace.sessionIds
-      if (Array.isArray(ids) && ids.includes(sessionId)) return workspace.id
-    }
-  } catch (e) {
-    console.warn('[turn-undo] Workspace lookup failed (falling back to cwd):', e.message)
-  }
-  return undefined
-}
-
-async function forkAndMarkUndone(ctx, sessionId, messageSeq, promptText) {
-  const source = await readSession(ctx, sessionId)
-  if (!source) throw new Error('source session not found')
-  const b = resolveForkBoundary(source, messageSeq, promptText)
-
-  console.info(
-    '[turn-undo] resolveBoundary session=' + sessionId,
-    'messageSeq=' + messageSeq,
-    'boundary=' + String(b.boundary),
-    'turn=' + String(b.turn),
-    'reason=' + b.reason,
-  )
+async function forkAndArchiveSession({ sessionController, workspaceController, sessionQuery }, sessionId, boundary, sourceCwd) {
   let childId
-  if (typeof b.boundary === 'number') {
-    // fork() 会自动把子会话 attach 到 source 所在的 workspace（见上游
-    // commands.ts forkWorkspace），所以 fork 分支在侧栏可见。
-    const { sessionId: cid } = await ctx.sessionController.fork({ sessionId, atSeq: b.boundary })
+  let createFallback = false
+  if (typeof boundary === 'number') {
+    // fork() attaches the child to the source workspace automatically
+    // (upstream commands.ts forkWorkspace), so it appears in the sidebar.
+    const { sessionId: cid } = await sessionController.fork({ sessionId, atSeq: boundary })
     childId = cid
   } else {
-    // create() 只有显式给 workspaceId 才会 attachSession；只给 cwd 的会话
-    // 不会进 workspace 目录，GUI 侧栏看不到 —— 这正是「原会话改名了但没有
-    // 新会话出现」的根因。所以先反查 source 所属 workspace。
-    const cwd = source.header?.cwd
-    if (!cwd) throw new Error('cannot undo first message without a cwd')
-    const workspaceId = findWorkspaceIdForSession(ctx, sessionId)
-    const created = await ctx.sessionController.create({
-      ...(workspaceId !== undefined ? { workspaceId } : { cwd }),
-      ...(source.header?.agentPreset ? { agentPreset: source.header.agentPreset } : {}),
+    // Defensive fallback: never reached by the POST handler, which rejects
+    // targets without a boundary before calling this function.
+    createFallback = true
+    const created = await sessionController.create({
+      ...(sourceCwd ? { cwd: sourceCwd } : {}),
     })
     childId = created.sessionId
   }
 
+  // Best-effort: mark the old session undone before archiving it.
+  let renamed = false
   try {
     let oldTitle = ''
-    if (ctx.sessionQuery && typeof ctx.sessionQuery.readTitle === 'function') {
-      const t = await ctx.sessionQuery.readTitle(sessionId)
+    if (sessionQuery && typeof sessionQuery.readTitle === 'function') {
+      const t = await sessionQuery.readTitle(sessionId)
       oldTitle = t && t.title ? t.title : ''
     }
     const prefix = '（已撤销）'
     if (!oldTitle.startsWith(prefix)) {
-      await ctx.sessionController.rename({
+      await sessionController.rename({
         sessionId,
         title: prefix + (oldTitle || '（未命名会话）'),
       })
+      renamed = true
+    } else {
+      renamed = true
     }
   } catch (e) {
     console.warn('[turn-undo] Rename old session failed (non-fatal):', e.message)
   }
 
-  return childId
+  // Archive the old session so it leaves the active list and cannot continue.
+  // stopActivity:true stops any running model step first (archive otherwise
+  // refuses active sessions with workspace/session-active).
+  let archived = false
+  try {
+    if (workspaceController && typeof workspaceController.archiveSession === 'function') {
+      await workspaceController.archiveSession({ sessionId, stopActivity: true })
+      archived = true
+    }
+  } catch (e) {
+    console.warn('[turn-undo] Archive old session failed (non-fatal):', e.message)
+  }
+
+  return { newSessionId: childId, createFallback, renamed, archived }
 }
 // ===========================================================================
 // HTTP handler + plugin entry
 // ===========================================================================
 
-function createHandler(ctx, runtime, sessions, agents) {
+function createHandler({ sessions, sessionQuery, sessionController, workspaceController, logger }, runtime) {
+  // 请求路径只使用这里捕获的**服务引用**（构造时即 ACTIVE 的快照），
+  // 绝不通过 scope 动态解析 —— fiber 处于 LOADING/UNLOADING 窗口时
+  // 解析会抛 'cannot get required service ... in inactive context'。
   return async (request, response) => {
     try {
       if (request.method === 'GET') {
@@ -1262,43 +1125,9 @@ function createHandler(ctx, runtime, sessions, agents) {
         const promptTextParam = url.searchParams.get('promptText')
 
         if (!sessionId) return json(response, 400, { error: 'Missing sessionId' })
-
-        // /state 端点：读 session log 里所有 surfaceOp.replace marker，
-        // 返回被遮蔽的 seq 列表（client 启动/切会话时拉取，用于恢复 DOM 隐藏）。
-        if (url.pathname === API_PATH + '/state') {
-          try {
-            const source = await readSession(ctx, sessionId)
-            if (!source) return json(response, 404, { error: 'Session not found' })
-            const events = Array.isArray(source.events) ? source.events : []
-            const hidden = new Set()
-            const hiddenTurns = new Set()
-            for (const ev of events) {
-              // 只统计**撤销 marker**，排除 DSH compaction checkpoint：
-              // 两者都是 user/message + surfaceOp.replace，但我们的撤销 marker
-              // 是空 content；compaction checkpoint 带 summary 文本（非空）。
-              if (ev.type === 'user/message' && ev.surfaceOp && ev.surfaceOp.op === 'replace'
-                  && Array.isArray(ev.content) && ev.content.length === 0) {
-                const srcs = ev.sourceEventSeqs
-                if (Array.isArray(srcs)) {
-                  for (const s of srcs) hidden.add(s)
-                  // 最小 seq 即该 replace 的 targetSeq，算出要隐藏的 turn 号
-                  if (srcs.length) {
-                    const tseq = Math.min.apply(null, srcs)
-                    for (const t of turnsForShadow(events, tseq)) hiddenTurns.add(t)
-                  }
-                }
-              }
-            }
-            return json(response, 200, { ok: true, hiddenSeqs: Array.from(hidden), hiddenTurns: Array.from(hiddenTurns) })
-          } catch (e) {
-            console.error('[turn-undo] /state failed:', e.message)
-            return json(response, 200, { ok: true, hiddenSeqs: [], hiddenTurns: [] })
-          }
-        }
-
-        // 单次 readSession 即可：live 会话的 snapshotEvents() 会重放事件，
+        // 单次 readSessionLive 即可：live 会话的 snapshotEvents() 会重放事件，
         // 每个请求读两遍是纯浪费。
-        const source = await readSession(ctx, sessionId)
+        const source = await readSessionLive(sessions, sessionQuery, sessionId)
         if (!source) return json(response, 404, { error: 'Session not found' })
 
         let targetTurn = null
@@ -1332,6 +1161,8 @@ function createHandler(ctx, runtime, sessions, agents) {
 
         let preview
         try {
+          const chainLen = runtime.store.loadChain(sessionId).length
+          logger?.info?.('[turn-undo] preview sid=' + sessionId + ' targetTurn=' + targetTurn + ' chainLen=' + chainLen + ' cwd=' + getCwd(source))
           preview = runtime.store.preview(sessionId, targetTurn, getCwd(source))
         } catch (e) {
           logger?.warn?.('[turn-undo] preview failed:', e.message)
@@ -1362,7 +1193,7 @@ function createHandler(ctx, runtime, sessions, agents) {
         const restoreFiles = data.restoreFiles !== false
         if (!sessionId) return json(response, 400, { error: 'Missing sessionId' })
 
-        const source = await readSession(ctx, sessionId)
+        const source = await readSessionLive(sessions, sessionQuery, sessionId)
         if (!source) return json(response, 400, { error: 'Session not found' })
         const cwd = getCwd(source)
         const b = messageSeq !== null
@@ -1391,7 +1222,7 @@ function createHandler(ctx, runtime, sessions, agents) {
         try { await runtime.waitForSnapshots() } catch {}
 
         // 3.5-4. 文件恢复：仅在用户勾选"同时回退文件"时执行。
-        //    restoreFiles=false = 只回退对话（surface replace），不动任何文件。
+        //    restoreFiles=false = 只回退对话（fork 新会话），不动任何文件。
         let restoreResult
         if (restoreFiles) {
           // Safety snapshot: before this irreversible restore wipes files,
@@ -1410,20 +1241,22 @@ function createHandler(ctx, runtime, sessions, agents) {
           restoreResult = { ok: true, skipped: true, reason: 'files-disabled', restoredFiles: 0, deletedFiles: 0 }
         }
 
-        // 5. 原会话就地回退（surface replace，不 fork、不新建会话、不改名）。
-        //    追加一条 user/message + surfaceOp.replace，遮蔽目标消息及之后的
-        //    全部 surface 节点 —— LLM 上下文与 web 转录同步回退，sessionId 不变。
-        let rewindPlan = null
-        let resolved = null
+        // 5. Fork + archive：从 boundary 以前的日志前缀创建子会话
+        //    （真撤销——子会话日志不含被撤销事件），随后改名并归档旧会话。
+        //    文件恢复已在第 4 步完成（restoreFiles=false 时跳过）。
+        let forkResult
         try {
-          resolved = await ctx.sessionController.resolveAgent(sessionId)
-          if ('error' in resolved) throw resolved.error
-          rewindPlan = await executeSurfaceRewind(resolved.agent, messageSeq)
+          forkResult = await forkAndArchiveSession(
+            { sessionController, workspaceController, sessionQuery },
+            sessionId,
+            b.boundary,
+            cwd,
+          )
         } catch (e) {
-          console.error('[turn-undo] Surface rewind failed:', e.message)
+          console.error('[turn-undo] Fork failed:', e.message)
           return json(response, 200, {
             ok: false,
-            status: 'rewind-failed',
+            status: 'fork-failed',
             error: e.message,
             restore: restoreResult && {
               ok: restoreResult.ok === true,
@@ -1432,25 +1265,15 @@ function createHandler(ctx, runtime, sessions, agents) {
           })
         }
 
-        // 持久化：把标记事件落盘，重启后重放仍保持回退状态。
-        try {
-          await ctx.sessions.flush(resolved.agent.session)
-        } catch (e) {
-          console.warn('[turn-undo] flush failed (non-fatal):', e?.message)
-        }
-
         return json(response, 200, {
           ok: true,
           status: 'completed',
-          sessionId,                       // 原会话 id（就地回退，无新会话）
-          newSessionId: null,              // 保持 client 兼容：null = 未 fork
-          rewind: {
-            targetSeq: rewindPlan.targetSeq,
-            shadowedCount: rewindPlan.shadowedSeqs.length,
-            surfaceStart: rewindPlan.surfaceStart,
-            surfaceEnd: rewindPlan.surfaceEnd,
-            shadowedSeqs: rewindPlan.shadowedSeqs,
-            shadowedTurns: rewindPlan.shadowedTurns,
+          sessionId,                       // 旧会话 id（已改名并归档）
+          newSessionId: forkResult.newSessionId,
+          forked: {
+            createFallback: forkResult.createFallback,
+            renamed: forkResult.renamed,
+            archived: forkResult.archived,
           },
           restore: {
             ok: restoreResult?.ok === true,
@@ -1508,22 +1331,27 @@ export function apply(ctx, config = {}) {
 
   // HTTP API endpoints.
   ctx.inject(
-    ['webServer', 'sessions', 'sessionQuery', 'agents', 'sessionTitle', 'sessionController', 'workspaceRegistry'],
+    // handler 只在这五条服务 ACTIVE 时创建一次，请求路径用捕获的引用，
+    // 不从 scope 动态解析 —— 见 createHandler 注释（inactive context 修复）。
+    ['webServer', 'sessions', 'sessionQuery', 'sessionController', 'workspaceController'],
     (scope) => {
       scope.effect(() => {
-        const handler = createHandler(scope, runtime, scope.sessions, scope.agents)
-        scope.webServer.register({
+        const handler = createHandler(
+          {
+            sessions: scope.sessions,
+            sessionQuery: scope.sessionQuery,
+            sessionController: scope.sessionController,
+            workspaceController: scope.workspaceController,
+            logger,
+          },
+          runtime,
+        )
+        // 必须显式注册到 webServer，否则路由 404。
+        return scope.webServer.register({
           kind: 'exact',
           path: API_PATH,
           handler,
         })
-        // /state 子路径：client 启动/切会话时拉取，恢复历史撤销的 DOM 隐藏。
-        scope.webServer.register({
-          kind: 'exact',
-          path: API_PATH + '/state',
-          handler,
-        })
-        return () => {}
       }, 'turn-undo: http-api')
     },
   )
@@ -1690,14 +1518,20 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
     })
   }
 
-  // Detect rename/move: same content hash, different path
+  // Detect rename/move: same content hash, different path.
+  // O(del × create) 双循环在文件多时是平方级（一百个文件 = 万次比较）；
+  // 用 hash 索引降为线性：每个 hash 最多匹配一对 rename。
+  const byHash = new Map() // hash -> created index
+  for (let j = 0; j < created.length; j++) {
+    if (!byHash.has(created[j].hash)) byHash.set(created[j].hash, j)
+  }
+  const renameMap = []
   for (let i = 0; i < deleted.length; i++) {
-    for (let j = 0; j < created.length; j++) {
-      if (deleted[i].hash === created[j].hash) {
-        deleted[i].matched = true
-        created[j].matched = true
-      }
-    }
+    const j = byHash.get(deleted[i].hash)
+    if (j === undefined) continue
+    deleted[i].matched = true
+    created[j].matched = true
+    renameMap.push({ oldPath: deleted[i].path, newPath: created[j].path })
   }
 
   return {
@@ -1706,9 +1540,6 @@ SnapshotStore.prototype.preview = function (sessionId, targetTurn, cwd) {
     targetTurn,
     totalChanges: changes.length,
     changes,
-    renameMap: deleted.filter(d => d.matched).map(d => ({ 
-      oldPath: d.path, 
-      newPath: created.find(c => c.matched)?.path 
-    })).filter(Boolean),
+    renameMap,
   }
 }

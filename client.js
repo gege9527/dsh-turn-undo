@@ -226,7 +226,8 @@ window.__ModuleLoader__.load({
                       console.warn('[turn-undo] Failed to open restored session:', e.message)
                     }
                     if (!conversationSvc || !conversationSvc.input || !draftText) return
-                    function trySetDraft(remaining) {
+                    // 立即尝试填草稿（新会话可能还没渲染好，失败后短间隔重试）。
+                    function trySetDraft(remaining, delay) {
                       if (remaining <= 0) return
                       try {
                         var shell = conversationSvc.input.shell(newSessionId)
@@ -239,28 +240,10 @@ window.__ModuleLoader__.load({
                           console.warn('[turn-undo] Failed to set draft in new session:', e.message)
                         }
                       }
-                      setTimeout(function () { trySetDraft(remaining - 1) }, 100)
+                      setTimeout(function () { trySetDraft(remaining - 1, delay) }, delay)
                     }
-                    trySetDraft(20)
-                  },
-                  // 就地回退：只填当前会话草稿，不导航（sessionId 不变，
-                  // 调 openSession(当前id) 会触发重渲染丢草稿）。
-                  setDraft: function (sid, draftText) {
-                    if (!conversationSvc || !conversationSvc.input || !draftText) return
-                    function trySetDraft(remaining) {
-                      if (remaining <= 0) return
-                      try {
-                        var shell = conversationSvc.input.shell(sid)
-                        if (shell && typeof shell.setDraft === 'function') {
-                          shell.setDraft(draftText)
-                          return
-                        }
-                      } catch (e) {
-                        if (remaining <= 1) console.warn('[turn-undo] setDraft failed:', e.message)
-                      }
-                      setTimeout(function () { trySetDraft(remaining - 1) }, 100)
-                    }
-                    trySetDraft(20)
+                    // 首次立即尝试，失败后用 50ms 短间隔重试 40 次（总 2s）。
+                    trySetDraft(40, 50)
                   },
                 }
               },
@@ -272,14 +255,12 @@ window.__ModuleLoader__.load({
       function RestoreMessagePortals(props) {
         var sessionId = props.sessionId
         var openRestoredSessionProp = props.openRestoredSession
-        var setDraftProp = props.setDraft
         var useChat = props.useChat
 
         // 卡死根因 1：裸用 `useChat(s => s.nodes.values())`。
         // NodesView.values() 在 upsert 后构建**新数组**（流式输出期间几乎每帧都 dirty），
         // 而 useSyncExternalStoreWithSelector 的默认比较是 Object.is(选择器返回值)
-        // → 组件每帧重渲染 → useLayoutEffect([nodes]) 每帧 teardown/recreate
-        // body-subtree 的 MutationObserver + 全页扫描 → GUI 卡死。
+        // → 组件每帧重渲染 → effect 每帧重跑 → GUI 卡死。
         // 修复：用 eq 按内容比较，内容不变时选择器返回旧数组引用，渲染与 effect 都稳定。
         var nodes = useChat(function (snapshot) {
           return snapshot.nodes ? snapshot.nodes.values() : []
@@ -289,74 +270,14 @@ window.__ModuleLoader__.load({
         var targets = targetsState[0]
         var setTargets = targetsState[1]
 
+        // 只做一件事：把撤销按钮 portal 到每条 user 消息的操作行。
+        // 撤销语义完全由服务端 fork 承担（子会话日志物理上不含被撤销事件），
+        // 客户端不再隐藏任何 DOM —— 不再有刷新后"消息复现"的问题。
         useLayoutEffect(function () {
-          var active = true
-          var timer = 0
-          _currentSessionId = sessionId
-          // 启动/切会话：拉 /state 恢复历史撤销的隐藏（刷新后从 log 反推）。
-          loadHiddenState(sessionId)
-          var refresh = function () {
-            if (!active) return
-            var next = collectPortalTargets(nodes)
-            setTargets(function (current) {
-              return samePortalTargets(current, next) ? current : next
-            })
-            // 给所有 user/steering row 打 data-dtu-seq 戳（供撤销后 DOM 隐藏）。
-            stampSeqs(nodes)
-            // 重新 apply 隐藏（React 重建 DOM 后 display:none 会丢）。
-            hideRows(null)
-          }
-          // 卡死根因 2：observer 回调对**任何** body 变更都跑全页扫描
-          // （流式 token、输入框、hover 状态都在内）。只有关心 user/steering 行
-          // 内部的变更才值得重扫；其余记录直接丢弃。
-          // 再叠加 80ms 时间防抖，把"每帧重扫"压成"静默期结束后扫一次"。
-          var isRelevant = function (record) {
-            var target = record.target
-            var relevant = false
-            var node = target
-            while (node && node.nodeType === 1) {
-              if (node.hasAttribute && node.hasAttribute('data-chat-anchor-key')) {
-                relevant = node.getAttribute('data-chat-flow-kind') === 'user'
-                  || node.getAttribute('data-chat-flow-kind') === 'steering'
-                if (relevant) break
-              }
-              node = node.parentNode
-            }
-            if (!relevant && record.addedNodes) {
-              for (var i = 0; i < record.addedNodes.length; i++) {
-                var added = record.addedNodes[i]
-                var probe = added
-                while (probe && probe.nodeType === 1) {
-                  if (probe.hasAttribute && probe.hasAttribute('data-chat-anchor-key')) {
-                    relevant = probe.getAttribute('data-chat-flow-kind') === 'user'
-                      || probe.getAttribute('data-chat-flow-kind') === 'steering'
-                    break
-                  }
-                  probe = probe.parentNode
-                }
-                if (relevant) break
-              }
-            }
-            return relevant
-          }
-          var queueRefresh = function (records) {
-            if (!active) return
-            for (var i = 0; i < records.length; i++) {
-              if (isRelevant(records[i])) {
-                if (timer) clearTimeout(timer)
-                timer = setTimeout(refresh, 80)
-                return
-              }
-            }
-          }
-          refresh()
-          var observer = new MutationObserver(queueRefresh)
-          observer.observe(document.body, { childList: true, subtree: true })
-          return function () {
-            active = false
-            if (timer) clearTimeout(timer)
-            observer.disconnect()
-          }
+          var next = collectPortalTargets(nodes)
+          setTargets(function (current) {
+            return samePortalTargets(current, next) ? current : next
+          })
         }, [nodes])
 
         var portals = []
@@ -367,7 +288,6 @@ window.__ModuleLoader__.load({
               matched: target.matched,
               sessionId: sessionId,
               openRestoredSession: openRestoredSessionProp,
-            setDraft: setDraftProp,
             }),
             target.container,
             sessionId + ':' + String(target.matched.messageSeq),
@@ -401,7 +321,6 @@ window.__ModuleLoader__.load({
         var matched = props.matched
         var sessionId = props.sessionId
         var openRestoredSession = props.openRestoredSession
-        var setDraftProp = props.setDraft
         var messageSeq = matched.messageSeq
         var messageText = matched.promptText
         var openState = useState(false)
@@ -422,8 +341,9 @@ window.__ModuleLoader__.load({
         var doneState = useState(false)
         var done = doneState[0]
         var setDone = doneState[1]
-        // 是否同时回退文件（默认 true；取消勾选 = 只回退对话、不动文件）。
-        var restoreFilesState = useState(true)
+        // 是否同时回退文件（默认 false：撤销只回退对话，不动文件；
+        // 勾选 = 同时把文件回退到这条消息发送前的状态）。
+        var restoreFilesState = useState(false)
         var restoreFiles = restoreFilesState[0]
         var setRestoreFiles = restoreFilesState[1]
 
@@ -441,7 +361,14 @@ window.__ModuleLoader__.load({
           fetch(API_PATH + '?sessionId=' + encodeURIComponent(sessionId) + '&messageSeq=' + messageSeq + '&promptText=' + encodeURIComponent(messageText), {
             method: 'GET', headers: { 'Accept': 'application/json' }, cache: 'no-store',
           })
-            .then(function (res) { return res.json() })
+            .then(function (res) {
+              // 401/404 等非 JSON 响应必须先识别，否则 .json() 抛
+              // "Unexpected token ... not valid JSON"。
+              if (res.status === 401) throw new Error('未授权：请检查登录状态')
+              if (res.status === 404) throw new Error('接口未找到（插件未加载？请重启 DSH）')
+              if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (res.statusText || ''))
+              return res.json()
+            })
             .then(function (data) { setPreview(data) })
             .catch(function (err) { setError(err.message || '请求失败') })
             .finally(function () { setLoading(false) })
@@ -462,34 +389,32 @@ window.__ModuleLoader__.load({
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: sessionId, messageSeq: messageSeq, promptText: messageText, restoreFiles: restoreFiles }),
           })
-            .then(function (res) { return res.json() })
+            .then(function (res) {
+              // 401/404 等非 JSON 响应必须先识别，否则 .json() 抛
+              // "Unexpected token ... not valid JSON"。
+              if (res.status === 401) throw new Error('未授权：请检查登录状态')
+              if (res.status === 404) throw new Error('接口未找到（插件未加载？请重启 DSH）')
+              if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (res.statusText || ''))
+              return res.json()
+            })
             .then(function (data) {
-              if (data.error && data.ok === false) { setError(data.error); setApplying(false); return }
+              // 任何 error 字段都优先透传真实原因（500 响应只有 { error }，
+              // 不能因 ok 缺省就被兜底文案吞掉）。
+              if (data.error) { setError(data.error); setApplying(false); return }
+              // 旧版服务端（surface 就地回退）响应带 rewind 字段且无
+              // newSessionId —— host 未重载时会走到这里，给出明确指引。
+              if (data.rewind) {
+                setError('插件服务端未重载（仍在运行旧版撤销逻辑）。请重启 DSH 后重试。'); setApplying(false); return
+              }
+              if (!data.newSessionId) {
+                setError('撤销失败：未创建新会话（服务端可能未重载，请重启 DSH 后重试）'); setApplying(false); return
+              }
               setDone(true)
               setApplying(false)
               setOpen(false)
-              // 就地回退：sessionId 不变，不切换会话，只把原消息填进
-              // 当前会话输入框（草稿，未发送，可编辑）。
-              if (data.rewind || data.newSessionId) {
-                var targetId = data.sessionId || data.newSessionId
-                if (data.newSessionId && openRestoredSession) {
-                  openRestoredSession(data.newSessionId, messageText)
-                } else if (setDraftProp) {
-                  // 原会话就地回退：只填草稿，不导航（sessionId 未变）。
-                  setDraftProp(targetId, messageText)
-                }
-                // 立即隐藏被撤销的 DOM row（user 消息按 seq，AI 回复按 turn）。
-                if (data.rewind) {
-                  if (data.rewind.shadowedSeqs) hideRows(data.rewind.shadowedSeqs)
-                  if (data.rewind.shadowedTurns && data.rewind.shadowedTurns.length) {
-                    var m = getSessionHidden(_currentSessionId)
-                    for (var i = 0; i < data.rewind.shadowedTurns.length; i++) {
-                      m['turn:' + _currentSessionId + ':' + data.rewind.shadowedTurns[i]] = true
-                    }
-                    hideRows(null)
-                  }
-                }
-              }
+              // 撤销 = fork：打开不含被撤销消息的新会话，并把原消息填进
+              // 新会话的输入框草稿（可编辑后重发）。旧会话已由服务端改名并归档。
+              if (openRestoredSession) openRestoredSession(data.newSessionId, messageText)
             })
             .catch(function (err) { setError(err.message || '请求失败'); setApplying(false) })
         }
@@ -695,9 +620,9 @@ window.__ModuleLoader__.load({
                 loading ? h('p', { className: 'dtu-status' }, '正在检查可以恢复的项目文件…') : null,
                 previewError ? h('p', { className: 'dtu-error' }, previewError) : null,
                 (!loading && noSnapshot)
-                  ? h('p', { className: 'dtu-status' }, '该时点没有可用快照，将仅创建新会话。') : null,
+                  ? h('p', { className: 'dtu-status' }, '该时点没有可用快照，将仅创建新会话（旧会话将归档）。') : null,
                 (!loading && !noSnapshot && noBaseline)
-                  ? h('p', { className: 'dtu-status' }, '这条消息之前没有可用快照，无法恢复文件，将仅创建新会话。') : null,
+                  ? h('p', { className: 'dtu-status' }, '这条消息之前没有可用快照，无法恢复文件，将仅创建新会话（旧会话将归档）。') : null,
                 (!loading && !previewError && !noSnapshot && !noBaseline && changes.length === 0)
                   ? h('p', { className: 'dtu-status' }, '这条消息之前没有需要恢复的文件。') : null,
                 (!loading && !previewError && !noSnapshot && !noBaseline && changes.length > 0)
@@ -782,127 +707,6 @@ window.__ModuleLoader__.load({
           matched: matched,
           rowKey: ('key' in value && 'data' in value) ? value.key : ('node:' + String(node.seq)),
         }
-      }
-
-      // 给所有 seat 打戳，供撤销后隐藏 DOM：
-      //   - data-dtu-seq  —— user 消息（input-message 节点的 data.seq）
-      //   - data-dtu-turn —— 所有 seat 的 data-chat-turn（turn-process 内嵌的 AI 回复也覆盖）
-      // 撤销范围覆盖 user 消息 + 其后的 AI 回复；AI 回复嵌在 turn-process 节点里，
-      // 其 seat 没有自己的节点 seq，只能按 turn 号定位。
-      function stampSeqs(nodes) {
-        var nodeArr = (nodes && typeof nodes.length === 'number') ? nodes : Array.from(nodes || [])
-        var rows = new Map()
-        var elements = document.querySelectorAll('[data-chat-anchor-key]')
-        for (var i = 0; i < elements.length; i++) {
-          var element = elements[i]
-          var key = element.getAttribute('data-chat-anchor-key')
-          if (key) rows.set(key, element)
-        }
-        // 注意：data-dtu-seq 加 session id 前缀（和 data-dtu-turn 一致）。
-        // seq 号是 per-session 的，跨会话复用，不加前缀会误隐藏其他会话的同 seq 消息。
-        var sid = _currentSessionId || ''
-        for (var i = 0; i < nodeArr.length; i++) {
-          var node = nodeArr[i]
-          var data = node.data || node
-          var rowKey = ('key' in node) ? node.key : null
-          if (!rowKey) continue
-          var row = rows.get(rowKey)
-          if (!row) continue
-          if (typeof data.seq === 'number') {
-            row.setAttribute('data-dtu-seq', sid + ':' + data.seq)
-          }
-        }
-        // 第二个 pass：所有 seat 的 data-chat-turn（ChatNodeSeat 在 location.turn 存在时写）。
-        // 覆盖 turn-process 内嵌的 AI 回复 seat，它们没有节点 seq。
-        // turn 号是 per-session 的，加 session id 前缀防止跨会话冲突。
-        var turnSeats = document.querySelectorAll('[data-chat-turn]')
-        for (var j = 0; j < turnSeats.length; j++) {
-          var t = turnSeats[j].getAttribute('data-chat-turn')
-          turnSeats[j].setAttribute('data-dtu-turn', sid + ':' + t)
-        }
-      }
-
-      // 按 session 隔离要隐藏的目标集合：{sid: {'seq:8':true, 'turn:1':true}}
-      // seq 号跨会话复用，全局字典会导致新会话消息被旧会话的隐藏规则误隐藏。
-      var _hiddenBySession = {}
-      var _currentSessionId = null
-
-      function getSessionHidden(sid) {
-        var m = _hiddenBySession[sid]
-        if (!m) { m = {}; _hiddenBySession[sid] = m }
-        return m
-      }
-
-      // 按目标列表隐藏 DOM row（撤销后立即隐藏 + 刷新后恢复）。
-      // 每次 rows 变化（React 重建 DOM）都要重新调用，display:none 才不丢。
-      // turn-process seat 按 data-dtu-turn 隐藏；user 消息按 data-dtu-seq 隐藏。
-      function hideRows(targets) {
-        var sid = _currentSessionId
-        if (sid && targets && targets.length) {
-          var m = getSessionHidden(sid)
-          for (var i = 0; i < targets.length; i++) {
-            var t = targets[i]
-            if (t !== null && t !== undefined) m['seq:' + sid + ':' + t] = true
-          }
-        }
-        var m = sid ? _hiddenBySession[sid] : null
-        if (!m) return
-        var hidden = 0
-        var elements = document.querySelectorAll('[data-dtu-seq],[data-dtu-turn]')
-        for (var i = 0; i < elements.length; i++) {
-          var el = elements[i]
-          var seq = el.getAttribute('data-dtu-seq')
-          var turn = el.getAttribute('data-dtu-turn')
-          // seq/turn 都带 sid 前缀（stampSeqs 打戳时加的），map key 也带 sid。
-          var hide = (seq && m['seq:' + seq]) || (turn && m['turn:' + turn])
-          if (hide) {
-            if (el.getAttribute('data-dtu-hidden') !== '1') {
-              el.setAttribute('data-dtu-hidden', '1')
-              el.style.setProperty('display', 'none', 'important')
-              hidden++
-            }
-          } else if (el.getAttribute('data-dtu-hidden') === '1') {
-            el.removeAttribute('data-dtu-hidden')
-            el.style.removeProperty('display')
-          }
-        }
-        if (hidden) console.log('[turn-undo] hidden rows:', hidden)
-      }
-
-      // 启动/切会话时拉 /state，恢复隐藏（刷新后从 session log 的 replace marker 反推）。
-      var _stateLoaded = {}
-      function loadHiddenState(sid) {
-        if (!sid) return
-        _currentSessionId = sid
-        // 已加载过的会话：用缓存规则重新应用（切回时清除新 DOM 的隐藏状态）。
-        if (_stateLoaded[sid]) {
-          hideRows(null)
-          return
-        }
-        _stateLoaded[sid] = true
-        _hiddenBySession[sid] = {}
-        fetch(API_PATH + '/state?sessionId=' + encodeURIComponent(sid))
-          .then(function (res) { return res.json() })
-          .then(function (data) {
-            // fetch 返回时可能已切走会话，只应用当前会话。
-            if (_currentSessionId !== sid) return
-            if (!data || !data.ok) return
-            var restored = 0
-            if (data.hiddenSeqs && data.hiddenSeqs.length) {
-              restored = data.hiddenSeqs.length
-              hideRows(data.hiddenSeqs)
-            }
-            if (data.hiddenTurns && data.hiddenTurns.length) {
-              restored += data.hiddenTurns.length
-              var m = getSessionHidden(sid)
-              for (var i = 0; i < data.hiddenTurns.length; i++) {
-                m['turn:' + sid + ':' + data.hiddenTurns[i]] = true
-              }
-              hideRows(null)
-            }
-            if (restored) console.log('[turn-undo] restored hidden targets:', restored)
-          })
-          .catch(function (e) { console.warn('[turn-undo] loadHiddenState failed:', e.message) })
       }
 
       function collectPortalTargets(nodes) {

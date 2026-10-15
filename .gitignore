@@ -15,3 +15,6 @@ Thumbs.db
 # Memory
 MEMORY.md
 memory/
+
+# Test artifacts
+/test-temp/

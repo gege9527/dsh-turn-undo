@@ -9,7 +9,7 @@
 - ✅ 确认后：
   - 恢复工作区文件到**发送该消息之前**的快照状态。
   - 通过 DSH 原生的 `sessionController.fork` 从该消息之前 fork 出新会话。
-  - 旧会话保留，标题前方自动加上 `（已撤销）`。
+  - 旧会话自动改名为 `（已撤销）` 并**归档**，从活跃列表移除、无法继续对话（历史仍可查）。
   - 新会话输入框自动填入被撤销的这条用户消息，方便你修改后重发。
 - ✅ 不依赖 git，适用于任何目录。
 - ✅ 快照去重（sha256 内容寻址），未变化文件零成本存储。
@@ -27,7 +27,7 @@ dsh plugin --profile <name> add dsh-turn-undo
 2. 点击按钮，弹窗列出撤销该消息后会影响的文件（该消息及之后所有轮次的改动）。
 3. 点击“确认恢复并继续”：
    - 文件恢复。
-   - 旧会话被标记为 `（已撤销）`。
+   - 旧会话改名为 `（已撤销）` 并归档，新会话自动打开。
    - 新会话打开，输入框里已有原消息内容。
 4. 在新会话里修改问题后重新发送即可。
 
@@ -42,20 +42,20 @@ dsh plugin --profile <name> add dsh-turn-undo
   - `$DSH_HOME/turn-undo/objects/<sha256>`（内容去重）
   - `$DSH_HOME/turn-undo/snapshots/<sessionId>/<turn>.json`（manifest：path → hash）
 - **恢复**：从 `turn - 0.5` 快照回写文件，并删除快照里不存在的文件。
-- **fork**：
-  - 调用 DSH 官方 web 同款的 `ctx.sessionController.fork({ sessionId, atSeq })`。
-  - 对“第一条用户消息”前面没有 completed turn 时，fall back 到 `ctx.sessionController.create({ cwd, agentPreset })` 创建空白会话。
-  - 旧会话通过 `ctx.sessionController.rename` 加上 `（已撤销）` 前缀。
+- **fork + archive（v0.1.0 起，撤销 = 真撤销）**：
+  - 调用 DSH 官方 web 同款的 `ctx.sessionController.fork({ sessionId, atSeq })`，`atSeq` = 目标消息前最近 `turn/end`（第一条消息取会话初始化点）。
+  - **子会话日志物理上不含被撤销事件** —— 模型上下文、web 转录、重启重放全部一致，不再需要 surface 遮蔽和客户端 DOM 隐藏（历史教训：`surfaceOp.replace` 只改模型侧，DSH 的 transcript 按设计保留 append 历史，刷新后消息必然复现，DOM 隐藏方案脆弱且不可靠）。
+  - 旧会话先 `rename` 加 `（已撤销）` 前缀，再 `workspaceController.archiveSession` 归档（`stopActivity: true`），从活跃列表移除。
 - **HTTP API**：
   - `GET /api/turn-undo?sessionId=...&messageSeq=...&promptText=...`：预览撤销该消息后会影响的文件（该消息之后所有轮次改动的并集）。
-  - `POST /api/turn-undo`（body `{ sessionId, messageSeq, promptText }`）：执行恢复 + fork。
+  - `POST /api/turn-undo`（body `{ sessionId, messageSeq, promptText }`）：执行文件恢复 + fork 新会话 + 归档旧会话，返回 `newSessionId`。
 
 ### 客户端（`client.js`）
 
 - `MutationObserver` 自动检测新增的用户消息。
 - 在用户消息的 IconActions 区域通过 portal 注入撤销按钮。
 - 弹窗组件：`RestoreButton` + `RestoreModal`。
-- 恢复完成后先打开新会话，再轮询设置输入框草稿（`conversation.input.shell(...).setDraft(...)`）。
+- 恢复完成后打开新会话，并把被撤销的消息写入新会话输入框草稿（`conversation.input.shell(...).setDraft(...)`），可编辑后重发。
 
 ## 配置
 
